@@ -62,9 +62,7 @@ def start_pipeline_signal_prediction(
     # n_search - number of combinations of scaling/feature selection/balancing/models to evaluate to find best combination
 
     # make list of named pipeline steps in the order in which they should be applied to the feature matrix
-    feature_selection = True
     if features_to_use == -1:
-        feature_selection = False
         features_to_use = 'all'
     steps = [
       ('scaler', None),
@@ -139,7 +137,7 @@ def start_pipeline_signal_prediction(
 
     # Feature selection
     best_features_translated = ['nan']
-    if False:
+    if features_to_use != 'all':
         best_features_fold = model['mutal_info'].get_support()
         best_features_fold = np.array(best_features_fold)
         best_features_fold = best_features_fold.reshape((features_to_use,dt*2))

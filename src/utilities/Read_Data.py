@@ -3,7 +3,6 @@ from scipy.stats import linregress
 import os
 
 import mne
-from mne.channels import make_dig_montage
 
 def read_raw_eeg(file_name):
     return mne.io.read_raw_brainvision(file_name, 
@@ -24,10 +23,8 @@ def read_subject_raw_nirs(
         tasks_to_do,
         trial_to_check={}, 
         nirs_event_translations={},
-        translation_events_dict={},
-        task_stimulous_to_crop={},
-        perform_time_correction=True,
-        eeg_time_max = {}):
+        eeg_translation_events_dict={},
+        task_stimulous_to_crop={}):
     raw_intensities = []
     counter = 0
 
@@ -39,67 +36,45 @@ def read_subject_raw_nirs(
                 raw_intensity = read_raw_nirs(subdir)
 
                 folder_name = os.path.basename(os.path.normpath(subdir))
-                if len(translation_events_dict) > 0:
+                if len(eeg_translation_events_dict) > 0:
                     session_index = session_names.index(folder_name)
-                    eeg_events = translation_events_dict[task_name][session_index]['events'].copy()
-                    event_translations = translation_events_dict[task_name][session_index]['translations'].copy()
+                    eeg_events = eeg_translation_events_dict[task_name][session_index]['events'].copy()
+                    event_translations = eeg_translation_events_dict[task_name][session_index]['translations'].copy()
 
                     # Transform events to fNIRS time
-                    if perform_time_correction:
-                        original_events, single_events_dict = mne.events_from_annotations(raw_intensity)
-                        for v,k in single_events_dict.items():
-                            if v in nirs_event_translations[task_name]:
-                                original_events[:,2][original_events[:,2] == k] = event_translations[nirs_event_translations[task_name][v]]
-                            else:
-                                original_events = np.delete(original_events, np.where(original_events[:,2] == k), axis=0)
+                    original_events, single_events_dict = mne.events_from_annotations(raw_intensity)
+                    for v,k in single_events_dict.items():
+                        if v in nirs_event_translations[task_name]:
+                            original_events[:,2][original_events[:,2] == k] = event_translations[nirs_event_translations[task_name][v]]
+                        else:
+                            original_events = np.delete(original_events, np.where(original_events[:,2] == k), axis=0)
 
-                        eeg_tmp = eeg_events[np.isin(eeg_events[:,2], original_events[:,2])]
+                    check_not_same_events = np.isin(eeg_events[:,2], original_events[:,2])
+                    eeg_events_tmp = eeg_events[check_not_same_events]
 
-                        fnirs_time = np.array(original_events[:,0])/raw_intensity.info['sfreq']
-                        eeg_time = np.array(eeg_tmp[:,0])/1000
+                    fnirs_time = np.array(original_events[:,0])/raw_intensity.info['sfreq']
+                    eeg_time = np.array(eeg_events_tmp[:,0])/1000
 
-                        # Get time offset coeficients
-                        lr = linregress(eeg_time, fnirs_time)
-                        m_1=lr.slope
-                        c_1=lr.intercept
-                        
-                        # Match fnirs and eeg time for the specific session by the calculated coeficients
-                        # fnirs_frame_count_ind = np.array(list(range(raw_intensity.get_data().shape[1])))
-                        # nirs_frame_time = fnirs_frame_count_ind/raw_intensity.info['sfreq']
-                        # eeg_frame_time = (nirs_frame_time*m_1)+c_1 #(nirs_frame_time-c_1)/m_1
-                        # fnirs_frame_count_sub = eeg_frame_time*raw_intensity.info['sfreq']
-                        # fnirs_frame_count_sub = np.rint(fnirs_frame_count_sub).astype(int)
+                    # Get time offset coeficients
+                    lr = linregress(eeg_time, fnirs_time)
+                    m_1=lr.slope
+                    c_1=lr.intercept
 
-                        # fnirs_frame_count_sub = fnirs_frame_count_sub[fnirs_frame_count_sub < fnirs_frame_count_ind.shape[0]]
-                        # fnirs_frame_count_sub = fnirs_frame_count_sub[fnirs_frame_count_sub >= 0]
+                    # Add translated eeg events
+                    # check_not_same_events = np.logical_not(check_not_same_events)
+                    eeg_events_tmp = eeg_events.copy()
+                    new_fnirs_events = ((eeg_events_tmp[:,0]/1000)*m_1)+c_1
+                    new_fnirs_events = new_fnirs_events*raw_intensity.info['sfreq']
+                    eeg_events_tmp[:,0] = np.rint(new_fnirs_events)
 
-                        # print(fnirs_frame_count_ind, len(fnirs_frame_count_ind))
-                        # print(fnirs_frame_count_sub, len(fnirs_frame_count_sub))
-                        # print(raw_intensity.get_data().shape)
-                        # ad=asddas
-                        
-                        new_fnirs_events = ((eeg_events[:,0]/1000)*m_1)+c_1
-                        new_fnirs_events = new_fnirs_events*raw_intensity.info['sfreq']
-                        eeg_events[:,0] = np.rint(new_fnirs_events)
-                        
-                        # new_fnirs_events = (eeg_events[:,0]/1000)
-                        # new_fnirs_events = new_fnirs_events*raw_intensity.info['sfreq']
-                        # eeg_events[:,0] = np.rint(new_fnirs_events)
-
-                        reversed_event_translations = {v: k for k, v in event_translations.items()}
-                        annotation = mne.annotations_from_events(eeg_events, raw_intensity.info['sfreq'], event_desc=reversed_event_translations)
-                        raw_intensity.set_annotations(annotation)
-
-                    # raw_intensity.annotations.rename(event_translations[task_name])
-                    # Crop to time offset of eeg
-                    # raw_intensity.crop(tmin=np.min(fnirs_frame_count_sub)/raw_intensity.info['sfreq'])
-                    # t_max = (eegRaw.n_times - 1) / eegRaw.info['sfreq']
-                        
-                    # raw_intensity.annotations.rename(nirs_event_translations[task_name])
+                    reversed_event_translations = {v: k for k, v in event_translations.items()}
+                    annotation = mne.annotations_from_events(eeg_events_tmp, raw_intensity.info['sfreq'], event_desc=reversed_event_translations)
+                    raw_intensity.set_annotations(annotation)
 
                     # Crop to first - last event
                     events, single_events_dict = mne.events_from_annotations(raw_intensity)
                     crop_ids = [single_events_dict[i] for i in task_stimulous_to_crop[task_name]]
+                    # crop_ids = [event_translations[i] for i in task_stimulous_to_crop[task_name] if i in event_translations.keys()]
 
                     # Crop to first-last event
                     crop_index_start = np.array(np.where(np.isin(events[:,2], crop_ids))).min()
@@ -108,24 +83,9 @@ def read_subject_raw_nirs(
                     crop_index_end = np.array(np.where(np.isin(events[:,2], crop_ids))).max()
                     crop_tmax = events[crop_index_end][0]/raw_intensity.info['sfreq']
                     # Adjust for tmin
-                    crop_tmax += crop_tmin + 1
+                    crop_tmax += 40 + 1
 
                     raw_intensity.crop(tmin=crop_tmin, tmax=crop_tmax)
-
-
-                    events, single_events_dict = mne.events_from_annotations(raw_intensity)
-                    test_nirs_crops = np.array(np.where(np.isin(events[:,2], [1,4,7])))
-
-                    eeg_events = translation_events_dict[task_name][session_index]['events']
-                    test_eeg_crops = np.array(np.where(np.isin(eeg_events[:,2], [10001,10004,10007])))
-                    print(events[test_nirs_crops[0]])
-                    print(test_nirs_crops)
-                    print(eeg_events[test_eeg_crops[0]])
-                    print(test_eeg_crops)
-                    # print(f'nirs {raw_intensity.get_data().shape}')
-                    # print(f'events {events[-30:]}')
-                    # print(single_events_dict)
-                    # asd=asdas
 
                 raw_dict[task_name][session_index] = raw_intensity
     # something is wrong with the contentation of the nirs vs eeg contentation
@@ -134,7 +94,7 @@ def read_subject_raw_nirs(
         print(key)
         print(raw_dict[key].keys())
     print('FNIRS')
-    for task_name, sessions in translation_events_dict.items():
+    for task_name, sessions in eeg_translation_events_dict.items():
         print(task_name)
         session_order = list(sessions.keys())
         session_order.sort()
@@ -180,7 +140,7 @@ def read_subject_raw_eeg(
                     crop_index_end = np.array(np.where(np.isin(events[:,2], crop_ids))).max()
                     crop_tmax = events[crop_index_end][0]/raw_voltage.info['sfreq']
                     # Adjust for tmin
-                    crop_tmax += crop_tmin + 1
+                    crop_tmax += 40 + 1 # crop_tmin
 
                     # Add in session start
                     session_start = events[crop_index_start].copy()
@@ -217,7 +177,7 @@ def read_subject_raw_eeg(
     # Add locations
     locs = np.array(list(eeg_coords.values()))
     locs_dict = dict(zip(list(eeg_coords.keys()), locs))
-    montage = make_dig_montage(locs_dict, coord_frame='unknown')
+    montage = mne.channels.make_dig_montage(locs_dict, coord_frame='unknown')
     raw_eeg_voltage.set_montage(montage)
 
     return raw_eeg_voltage, events_dict

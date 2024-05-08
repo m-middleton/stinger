@@ -40,7 +40,7 @@ def eeg_ica_artifact_rejection(raw_voltage):
     #ica.plot_properties(raw_voltage, picks=0)
 
     # Manually find components
-    ica.exclude = [0,3]  # indices chosen based on various plots above
+    # ica.exclude = [0,3]  # indices chosen based on various plots above
 
     # # ica.apply() changes the Raw object in-place, so let's make a copy first:
     # reconst_raw = raw_voltage.copy()
@@ -50,11 +50,12 @@ def eeg_ica_artifact_rejection(raw_voltage):
     # reconst_raw.plot(show_scrollbars=False)
     # del reconst_raw
 
-    # # Find Components using EOG electrodes automagically
-    # ica.exclude = []
-    # # find which ICs match the EOG pattern
-    # eog_indices, eog_scores = ica.find_bads_eog(raw_voltage)
-    # ica.exclude = eog_indices
+    # Find Components using EOG electrodes automagically
+    ica.exclude = []
+    # find which ICs match the EOG pattern
+    eog_indices, eog_scores = ica.find_bads_eog(raw_voltage)
+    ica.exclude = eog_indices
+    print(f'ICA exclude: {ica.exclude}')
 
     # # barplot of ICA component "EOG match" scores
     # ica.plot_scores(eog_scores)
@@ -70,7 +71,39 @@ def eeg_ica_artifact_rejection(raw_voltage):
 
     return ica
 
-def process_eeg(raw_voltage, t_min, t_max, l_freq=None, h_freq=80, resample=200):
+def process_eeg_epochs(raw_voltage, t_min, t_max, baseline_correction=(None, 0)):
+    events, single_events_dict = mne.events_from_annotations(raw_voltage)
+    print(single_events_dict)
+    print(f'events: {len(events)}')
+    print(f'events in raw {events}')
+
+    # reject bad data
+    reject_criteria = dict(
+        eeg=150e-6,      # unit: V (EEG channels)
+        eog=250e-6      # unit: V (EOG channels)
+    )
+
+    flat_criteria = dict(eeg=1e-10) # 1 µV # 1e-6
+
+    epochs = mne.Epochs(
+        raw_voltage,
+        events,
+        event_id=single_events_dict,
+        tmin=t_min,
+        tmax=t_max,
+        baseline=baseline_correction,
+        event_repeated='drop',
+        reject=reject_criteria,
+        flat=flat_criteria,
+        preload=True,
+    )
+
+    #epochs.plot_drop_log()
+    # epochs.plot()
+
+    return epochs
+
+def process_eeg_raw(raw_voltage, l_freq=None, h_freq=80, resample=200):
     print(raw_voltage)
     print(raw_voltage.info)
 
@@ -89,58 +122,13 @@ def process_eeg(raw_voltage, t_min, t_max, l_freq=None, h_freq=80, resample=200)
     # ica.exclude = [1, 2]  # details on how we picked these are omitted here
     # ica.plot_properties(raw_voltage, picks=ica.exclude)
 
-    events, single_events_dict = mne.events_from_annotations(raw_voltage)
-    print(single_events_dict)
-    print(f'events: {len(events)}')
-    # print(events[np.isin(events[:,2],np.array([112,128,144]))])
-    # print(events[np.where(events[:,2] == 144)])
-    print(f'events in raw {events}')
-
     #events = np.delete(events, list(range(15,37)), 0)
     #print(f'events: {len(events)}')
 
     ica = eeg_ica_artifact_rejection(raw_voltage)
     ica.apply(raw_voltage)
 
-    # reject bad data
-    reject_criteria = dict(
-        eeg=150e-6,      # unit: V (EEG channels)
-        #eog=250e-6      # unit: V (EOG channels)
-    )
-
-    flat_criteria = dict(eeg=1e-6) # 1 µV
-
-    # epochs = mne.Epochs(
-    #     raw_voltage,
-    #     events,
-    #     event_id=single_events_dict,
-    #     tmin=t_min,
-    #     tmax=t_max,
-    #     event_repeated='merge',
-    #     reject=reject_criteria,
-    #     flat=flat_criteria,
-    #     preload=True,
-    # )
-    #epochs.plot_drop_log()
-    #epochs.plot()
-
-    #epochs.rename_channels({'FP1':'Fp1', 'AFF6':'AFF6h', 'FP2':'Fp2', 'AFF5':'AFF5h'})
-
     if resample is not None:
-        #epochs = epochs.resample(sfreq=resample)
         raw_voltage = raw_voltage.resample(sfreq=resample)
 
-    # plot all waves
-    # fig, axs = plt.subplots(len(filtered_waves_raw), 1,figsize=(50,30))
-    # axs = list(axs)
-    # for index, (wave_type, wave) in enumerate(filtered_waves_raw.items()):
-    #     axs[index].plot(wave.get_data()[0])
-    #     axs[index].set_title(f'{wave_type}')
-    # fig.tight_layout()
-    # pdf = PdfPages('eeg_waves_processing.pdf')
-    # pdf.savefig()
-    # pdf.close()
-    # plt.close()
-    #plt.show()
-
-    return raw_voltage, None #epochs
+    return raw_voltage

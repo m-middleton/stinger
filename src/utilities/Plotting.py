@@ -1,3 +1,8 @@
+'''
+    Plotting functions for EEG and NIRS data
+    - Michael M 2024
+'''
+
 import os
 import multiprocessing
 
@@ -14,102 +19,7 @@ from matplotlib.pyplot import cm
 import mne
 from mne.channels import make_dig_montage
 
-def _plot_variance_corelation(wave_type, 
-                           all_info,
-                           data_plot_dict,
-                           title='',
-                           subject_id=''):
-    fig = all_info.get_montage().plot(kind="topomap", scale_factor=0.00001, show_names=False, show=False, sphere=0.000001)
-
-    # mean_val = np.mean([np.mean(cov_matrix) for cov_matrix in cov_dict.values()])
-    # std_val = np.std([np.std(cov_matrix) for cov_matrix in cov_dict.values()])
-    # min_val = mean_val - std_val*2
-    # max_val = mean_val + std_val*2
-    min_val=None
-    max_val=None
-
-    plt.axis('scaled')
-    for ax, idx in mne.viz.iter_topography(
-        all_info,
-        fig=fig,
-        fig_facecolor="white",
-        axis_facecolor="white",
-        axis_spinecolor="white",
-        layout_scale=1,
-        #legend=True
-    ):
-        if idx != 0:
-            df = data_plot_dict[all_info.ch_names[idx]]
-            ax.matshow(df)
-            
-            plt.xticks(range(df.select_dtypes(['number']).shape[1]), df.select_dtypes(['number']).columns, fontsize=8, rotation=45)
-            plt.yticks(range(df.select_dtypes(['number']).shape[1]), df.select_dtypes(['number']).columns, fontsize=8)
-        #     sns.set_theme(font_scale=0.5)
-        #     sns.heatmap(data_plot_dict[all_info.ch_names[idx]],
-        #             annot=False,
-        #             cbar = True,
-        #             vmin=min_val, 
-        #             vmax=max_val,
-        #             ax = ax,
-        #             fmt='.2g',
-        #             cmap="YlGnBu",
-        #             square=True,
-        #             annot_kws={"fontsize":8},
-        #             xticklabels=[],
-        #             yticklabels=[]
-        #             )
-            ax.set_title(f"{all_info.ch_names[idx]}", fontsize=8)
-
-    fig.legend(loc='upper left', ncol=3)
-    plt.show()
-
-    fig.suptitle(f"{title} Matrixs EEG: {all_info.ch_names[0]} Wave: {wave_type}", fontsize=14)
-
-    
-    folder_path = f'./outputs/{title}/{wave_type}/'
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path)
-
-    # fig.tight_layout()
-    fig.savefig(os.path.join(folder_path, f'{all_info.ch_names[0]}_{subject_id}_{title}.png'), dpi=512)
-    # pdf = PdfPages(f'./outputs/covariance/{eeg_channel_name}_{wave_type}_covariance.pdf')
-    # pdf.savefig()
-    # pdf.close()
-    plt.close()
-
 def plot_corelation_matrix(eeg_channel_name, 
-                           wave_type,
-                           x_full, 
-                           y_full,
-                           dt,
-                           eeg_coords,
-                           nirs_coords,
-                           nirs_labels=[],
-                           subject_id=''):
-    
-    covariance, x_dict, all_info = plot_covariance_matrix(eeg_channel_name=eeg_channel_name, 
-                           wave_type=wave_type,
-                           x_full=x_full, 
-                           y_full=y_full,
-                           dt=dt,
-                           eeg_coords=eeg_coords,
-                           nirs_coords=nirs_coords,
-                           nirs_labels=nirs_labels,
-                           subject_id=subject_id)
-    cor_dict = {}
-    for title, covariance in covariance.items():
-        tmp = np.std(x_dict[title], axis=1)
-        tmp2 = np.std(y_full, axis=1)
-        std = np.mean(tmp*tmp2)
-        # print(tmp.shape)
-        # print(tmp2.shape)
-        # print(std.shape)
-        # asdas=asdsa
-        cor_dict[title] = covariance/std
-
-    _plot_variance_corelation(wave_type, all_info, cor_dict, title='correlation', subject_id=subject_id)
-
-def plot_covariance_matrix(eeg_channel_name, 
                            wave_type,
                            x_full_original, 
                            y_full_original,
@@ -152,97 +62,35 @@ def plot_covariance_matrix(eeg_channel_name,
     correlation_list = []
     print(f'y_full: {y_full_original.shape}')
 
-    # Get the closest multiple of dt
-    # y_length = y_full.shape[0]
-    # lower_multiple = y_length - (y_length % dt)
-    # higher_multiple = lower_multiple + dt if y_length % dt != 0 else lower_multiple
-
-    # # Determine which multiple is closest to the original length
-    # y_new_length = higher_multiple
-    # if (y_length - lower_multiple) <= (higher_multiple - y_length) or higher_multiple > y_length:
-    #     y_new_length = lower_multiple
-
-    # y_full_original = y_full[:y_new_length]
-    # x_full = x_full[:,:y_new_length]
-
     # Split into windows
-    
-    for offset in [0]:#np.arange(0, 30, 1):
-        x_dict = {}
-        # Repeat array 'y'
-        # y_full = y_full_original.reshape((-1,dt))
-        y_full = y_full_original.copy()
-        if offset != 0:
-            y_full = y_full[:-offset]
+    x_dict = {}
+    y_full = y_full_original.copy()
+    for channel_index in range(x_full_original.shape[0]):
+        name = channel_index
+        if len(nirs_labels) > 0: 
+            name = nirs_labels[channel_index]
+        
+        x_dict[name] = x_full_original[channel_index].copy()
 
-        for channel_index in range(x_full_original.shape[0]):
-            name = channel_index
-            if len(nirs_labels) > 0: 
-                name = nirs_labels[channel_index]
-            
-            x_dict[name] = x_full_original[channel_index].copy()
-            if offset != 0:
-                x_dict[name] = x_dict[name][offset:]
+    for x_title, x_all_time in x_dict.items():
+        if x_all_time.shape[0] != y_full.shape[0]:
+            print(f'{x_title} - broken shape x:{x_all_time.shape[0]} y:{y_full.shape[0]}')
+            continue
 
-        for x_title, x_all_time in x_dict.items():
+        # calculate maxwindows across the time
+        all_correlation, lag = mean_correlation_max(x_all_time, y_full)
+        correlation_list.append(all_correlation)
+        y_list.append(lag)
 
-            if x_all_time.shape[0] != y_full.shape[0]:
-                print(f'{x_title} - broken shape x:{x_all_time.shape[0]} y:{y_full.shape[0]}')
-                continue
+        x_list.append(distance_dict[x_title])
 
-            # calculate windows across
-
-            # Distance
-            tmp_correlation = []
-            # tmp_correlation = [np.corrcoef(y_full[i, :], x_all_time[i, :])[0, 1] for i in range(x_all_time.shape[0])]
-
-            # for i in range(x_all_time.shape[0]):
-            #     tmp_correlation.append(calculate_correlation(y_full[i], x_all_time[i]))
-
-            # for i in range(x_all_time.shape[0]):
-            #     correlation = pearsonr(y_full[i,:], x_all_time[i,:])[0]
-            #     tmp_correlation.append(correlation)
-            # all_correlation = np.mean(tmp_correlation)
-            # all_correlation = mean_correlation(y_full, x_all_time)
-
-
-            print(x_all_time.shape)
-            print(y_full.shape)
-
-            mean_x_all_time = np.mean(x_all_time, axis=0)
-            mean_y_full = np.mean(y_full, axis=0)
-
-            print(mean_x_all_time.shape)
-            print(mean_y_full.shape)
-
-            correlation = signal.correlate(mean_x_all_time, mean_y_full, mode="full")
-            lags = signal.correlation_lags(mean_x_all_time.size, y_full.size, mode="full")
-            lag = lags[np.argmax(correlation)]
-            correlation_list.append(correlation[np.argmax(correlation)])
-            y_list.append(lag)
-
-            x_list.append(distance_dict[x_title])
-            # y_list.append(offset*2)
-            # correlation_list.append(all_correlation)
-
-            # pandas
-            # # Build pandas
-            # pandas_dict = {}
-            # for i in range(x_all_time.shape[1]):
-            #     pandas_dict[f'nirs_{i}'] = x_all_time[:,i]
-            # for i in range(y_full.shape[1]):
-            #     pandas_dict[f'eeg_{i}'] = y_full[:,i]
-            # df = pd.DataFrame(pandas_dict)
-            # print(df)
-            # # Get covariance
-            # c = df.cov()
     # Create a scatter plot
     if fig is None:
         fig, ax1 = plt.subplots(sharex=True, sharey = True, figsize=(10,2))
     else:
         ax1 = fig.axes[0]
 
-    size = np.array(correlation_list) * 1000  # Adjust the factor as needed
+    size = np.array(correlation_list) * 30  # Adjust the factor as needed
     scatter = ax1.scatter(x_list, y_list, c=correlation_list, s=size, cmap='viridis')
 
     # # Adding color bar to show the correlation values
@@ -253,11 +101,14 @@ def plot_covariance_matrix(eeg_channel_name,
     # plt.ylabel('time offset')
     # plt.title('Scatter Plot with Correlation Colormap')
 
+    correlation_dict = dict(zip(nirs_labels, correlation_list))
+    lag_dict = dict(zip(nirs_labels, y_list))
+
     # # Show the plot
     # plt.show()
-    return fig, scatter
+    return fig, scatter, correlation_dict, lag_dict
 
-def calculate_correlations(array1, array2, size_ratio=0.5):
+def calculate_correlations_max(array1, array2, size_ratio=0.5):
 
     # Assuming array1 and array2 are defined and have the same shape
     n = np.arange(array1.shape[0])
@@ -267,30 +118,30 @@ def calculate_correlations(array1, array2, size_ratio=0.5):
     selected_array1 = array1[n]
     selected_array2 = array2[n]
 
-    # Standardize each array
-    standardized_array1 = (selected_array1 - selected_array1.mean(axis=1, keepdims=True)) / selected_array1.std(axis=1, keepdims=True)
-    standardized_array2 = (selected_array2 - selected_array2.mean(axis=1, keepdims=True)) / selected_array2.std(axis=1, keepdims=True)
+    correlations = []
+    lags = []
+    for i in range(selected_array1.shape[0]):
+        # single_correlations = signal.correlate(selected_array1[i,:], selected_array2[i,:], mode="full")
+        x = selected_array1[i,:]
+        y = selected_array2[i,:]
 
-    # Compute the correlation coefficients
-    correlations = (standardized_array1 * standardized_array2).mean(axis=1)
+        single_correlations = signal.correlate(x/np.std(x), y/np.std(y), 'full') / min(len(x), len(y))
+        single_lags = signal.correlation_lags(x.size, y.size, mode="full")
 
-    return correlations
+        correlation = single_correlations[np.argmax(single_correlations)]
+        lag = single_lags[np.argmax(single_correlations)]
 
-def mean_correlation(array1, array2):
-    correlations = calculate_correlations(array1, array2)
-    test = np.nanmean(correlations)
-    if np.any(np.isnan([test])):
-        print(correlations)
-        print(test)
-        print(array1)
-        print(array2)
-        print(array1.shape)
-        print(array2.shape)
-        asd=asdsds
+        correlations.append(correlation)
+        lags.append(lag)
+
+    return np.array(correlations), np.array(lags)
+
+def mean_correlation_max(array1, array2):
+    correlations, lags = calculate_correlations_max(array1, array2)
 
     # maximum cross correlation how much time lag
     # xcor matlab
-    return np.nanmean(correlations)  # nanmean to handle NaN values safely
+    return np.mean(correlations), np.mean(lags)
 
 def plot_eeg_nirs_brain(task_name, epoch_eeg, epoch_nirs, eeg_coords, nirs_cords):
     eeg_evoked = epoch_eeg[task_name].average().get_data()
@@ -471,86 +322,3 @@ def plot_correlation(nirs_channels, x_train, y_train, size):
 
     plt.legend()
     plt.show()
-
-
-'''
-def plot_covariance_matrix(eeg_channel_name, 
-                           wave_type,
-                           x_full, 
-                           y_full,
-                           dt,
-                           eeg_coords,
-                           nirs_coords,
-                           nirs_labels=[],
-                           subject_id='',
-                           plot=True):
-    # Construct info object
-    all_info = mne.create_info(
-        [eeg_channel_name] + nirs_labels,
-        sfreq=10,
-        ch_types='eeg',
-        verbose=None)
-
-    # Add locations
-    eeg_locs = np.array(list(eeg_coords.values()))
-    eeg_locs_dict = dict(zip(list(eeg_coords.keys()), eeg_locs))
-    nirs_locs = np.array(list(nirs_coords.values()))
-    nirs_locs_dict = dict(zip(list(nirs_coords.keys()), nirs_locs))
-
-    locs_dict = eeg_locs_dict | nirs_locs_dict
-    montage = make_dig_montage(locs_dict, coord_frame='unknown')
-    all_info.set_montage(montage)
-
-    print(f'x_full: {x_full.shape}')
-    print(f'y_full: {y_full.shape}')
-
-
-    eeg_point = eeg_coords[eeg_channel_name]
-    distance_dict = {}
-    for nirs_name, nirs_point in nirs_locs.items():
-        dist = np.linalg.norm(eeg_point-nirs_point)
-        distance_dict[nirs_name] = dist
-
-    # Repeat array 'y'
-    if len(nirs_labels) > 0: 
-        x_dict = {nirs_labels[ind]:x_full[:,window_start:window_start+(dt*2)] for ind, window_start in enumerate(list(range(0,x_full.shape[1],dt*2)))}
-    else:
-        x_dict = {ind:x_full[:,window_start:window_start+(dt*2)] for ind, window_start in enumerate(list(range(0,x_full.shape[1],dt*2)))}
-
-    print(f'{x_dict}')
-
-    cov_dict = {}
-    for x_title, x_all_time in x_dict.items():
-        # Distance
-        
-
-
-        # pandas
-        # # Build pandas
-        # pandas_dict = {}
-        # for i in range(x_all_time.shape[1]):
-        #     pandas_dict[f'nirs_{i}'] = x_all_time[:,i]
-        # for i in range(y_full.shape[1]):
-        #     pandas_dict[f'eeg_{i}'] = y_full[:,i]
-        # df = pd.DataFrame(pandas_dict)
-        # print(df)
-        # # Get covariance
-        # c = df.cov()
-
-        # Manual
-        # c = np.zeros((x_all_time.shape[1],x_all_time.shape[1]))
-        # for i in range(x_full.shape[0]):
-        #     y = y_full[i,:]
-        #     x = x_all_time[i,:]
-        #     # Get covariance
-        #     c_t = np.outer(x.T - x.mean(), y - y.mean())
-        #     c = c + c_t/x_full.shape[0]
-        #     # c = c + (c_t/x_full.shape[0])
-        
-        cov_dict[x_title] = c
-
-    if plot:
-        _plot_variance_corelation(wave_type, all_info, cov_dict, title='Covariance', subject_id=subject_id)
-
-    return cov_dict, x_dict, all_info
-'''

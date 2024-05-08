@@ -26,7 +26,42 @@ def nirs_ica_artifact_rejection(raw_intensity):
 
     return ica
 
-def process_nirs(raw_intensity, t_min, t_max, resample=10, baseline_correction = (None, 0)):
+def process_nirs_epochs(raw_haemo, t_max, t_min, baseline_correction=None):
+    events, single_events_dict = mne.events_from_annotations(raw_haemo)
+
+    # Uncomment this for event processing
+    # events, event_dict_true = mne.events_from_annotations(raw_haemo)
+    # reversed_event_dict = {v: k for k, v in events_dict.items()}
+    # single_events_dict = {reversed_event_dict[int(k)]:v for k, v in event_dict_true.items() if int(k) in reversed_event_dict.keys()}
+    
+    # print(f'events: {len(events)}')
+    # print(events[np.isin(events[:,2],np.array([112,128,144]))])
+
+    # fig = mne.viz.plot_events(events, event_id=event_dict, sfreq=raw_haemo.info["sfreq"])
+    # fig.subplots_adjust(right=0.7)  # make room for the legend
+    # plt.show()
+
+    # Epochs / reject / basline correction
+    # reject_criteria = dict(hbo=80e-6)
+
+    epochs = mne.Epochs(raw_haemo, 
+                        events,
+                        event_id=single_events_dict,
+                        tmin=t_min, 
+                        tmax=t_max,
+                        # reject=reject_criteria, 
+                        # reject_by_annotation=True,
+                        proj=True, 
+                        baseline=baseline_correction, 
+                        event_repeated='drop',
+                        preload=True,
+                        detrend=None, 
+                        verbose=True)
+    #epoch_nirs.plot_drop_log()
+
+    return epochs
+
+def process_nirs_raw(raw_intensity, resample=10):
     print(raw_intensity)
     print(raw_intensity.info)
 
@@ -117,41 +152,7 @@ def process_nirs(raw_intensity, t_min, t_max, resample=10, baseline_correction =
     # input("Press Enter to continue...")
     # asdas=asdasd
 
-    events, single_events_dict = mne.events_from_annotations(raw_haemo)
-
-    # Uncomment this for event processing
-    # events, event_dict_true = mne.events_from_annotations(raw_haemo)
-    # reversed_event_dict = {v: k for k, v in events_dict.items()}
-    # single_events_dict = {reversed_event_dict[int(k)]:v for k, v in event_dict_true.items() if int(k) in reversed_event_dict.keys()}
-    
-    # print(f'events: {len(events)}')
-    # print(events[np.isin(events[:,2],np.array([112,128,144]))])
-
-    # fig = mne.viz.plot_events(events, event_id=event_dict, sfreq=raw_haemo.info["sfreq"])
-    #fig.subplots_adjust(right=0.7)  # make room for the legend
-    # plt.show()
-
-    # Epochs / reject / basline correction
-    # reject_criteria = dict(hbo=80e-6)
-    #baseline_correction = (None, 0)
-
-    epochs = mne.Epochs(raw_haemo, 
-                        events,
-                        event_id=single_events_dict,
-                        tmin=t_min, 
-                        tmax=t_max,
-                        # reject=reject_criteria, 
-                        # reject_by_annotation=True,
-                        proj=True, 
-                        baseline=baseline_correction, 
-                        event_repeated='merge',
-                        preload=True,
-                        detrend=None, 
-                        verbose=True)
-    #epoch_nirs.plot_drop_log()
-
     if resample is not None:
-        epochs = epochs.resample(sfreq=resample)
         raw_haemo = raw_haemo.resample(sfreq=resample)
 
-    return epochs, raw_haemo
+    return raw_haemo
