@@ -1,3 +1,6 @@
 [submodule "src/src/iTransformer"]
 	path = src/src/iTransformer
 	url = https://github.com/m-middleton/iTransformer.git
+[submodule "src/iTransformer"]
+	path = src/iTransformer
+	url = https://github.com/m-middleton/iTransformer.git
