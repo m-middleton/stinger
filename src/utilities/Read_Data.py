@@ -1,8 +1,36 @@
+'''
+This file contains functions to read data from the .mat files and the .vhdr files
+'''
+
 import numpy as np
 from scipy.stats import linregress
 import os
 
 import mne
+from scipy.io import loadmat
+
+def read_matlab_file(subject_id, base_path):
+    '''Read matlab file and return data'''
+    subject_data = loadmat(os.path.join(base_path, 'matfiles', f'data_vp0{subject_id}.mat'))['subject_data_struct'][0]
+    # eeg subject_data[1][0]
+    eeg_data = []
+    for session_eeg_data in subject_data[1][0]:
+        eeg_data.append(session_eeg_data.T)
+    eeg_data = np.hstack(eeg_data)
+    # fnirs subject_data[3][0]
+    nirs_data = []
+    for session_nirs_data in subject_data[3][0]:
+        nirs_data.append(session_nirs_data.T)
+    nirs_data = np.hstack(nirs_data)
+    # mrk subject_data[5][0]
+    mrk_data = []
+    for session_mrk_data in subject_data[5][0]:
+        mrk_data.append(session_mrk_data.T)
+    mrk_data = np.hstack(mrk_data)
+
+    assert eeg_data.shape[1] == nirs_data.shape[1]
+
+    return eeg_data, nirs_data, mrk_data
 
 def read_raw_eeg(file_name):
     return mne.io.read_raw_brainvision(file_name, 
@@ -105,7 +133,7 @@ def read_subject_raw_nirs(
             
 
     raw_intensities = mne.concatenate_raws(raw_intensities)
-    return raw_intensities, {}
+    return raw_intensities
 
 def read_subject_raw_eeg(
         root_directory, 

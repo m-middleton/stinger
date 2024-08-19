@@ -26,7 +26,7 @@ def nirs_ica_artifact_rejection(raw_intensity):
 
     return ica
 
-def process_nirs_epochs(raw_haemo, t_max, t_min, baseline_correction=None):
+def process_nirs_epochs(raw_haemo, t_max, t_min, baseline_correction=[None,0]):
     events, single_events_dict = mne.events_from_annotations(raw_haemo)
 
     # Uncomment this for event processing
@@ -42,7 +42,7 @@ def process_nirs_epochs(raw_haemo, t_max, t_min, baseline_correction=None):
     # plt.show()
 
     # Epochs / reject / basline correction
-    # reject_criteria = dict(hbo=80e-6)
+    reject_criteria = dict(hbo=80e-6)
 
     epochs = mne.Epochs(raw_haemo, 
                         events,
@@ -130,7 +130,6 @@ def process_nirs_raw(raw_intensity, resample=10):
     axs[1].plot(raw_haemo.copy().filter(0.003, 0.08).get_data()[0])
     axs[1].set_title('band pass')
 
-    raw_haemo._data = filtered_data_dwt
     axs[2].plot(raw_haemo.get_data()[0])
     axs[2].set_title('filtered')
 
