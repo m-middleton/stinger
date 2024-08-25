@@ -1,7 +1,7 @@
 from os.path import join
 
-# BASE_PATH = '../data/'
-BASE_PATH = '../../data/'
+BASE_PATH = '../data/'
+# BASE_PATH = '../../data/'
 
 ROOT_DIRECTORY_EEG = join(BASE_PATH, 'raw/eeg/')
 ROOT_DIRECTORY_NIRS = join(BASE_PATH, 'raw/nirs/')

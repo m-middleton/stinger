@@ -71,7 +71,7 @@ def eeg_ica_artifact_rejection(raw_voltage):
 
     return ica
 
-def process_eeg_epochs(raw_voltage, t_min, t_max, baseline_correction=(None, 0)):
+def process_eeg_epochs(raw_voltage, t_min, t_max, baseline_correction=[None,0]):#(None, 0)):
     events, single_events_dict = mne.events_from_annotations(raw_voltage)
     print(single_events_dict)
     print(f'events: {len(events)}')
@@ -93,9 +93,10 @@ def process_eeg_epochs(raw_voltage, t_min, t_max, baseline_correction=(None, 0))
         tmax=t_max,
         baseline=baseline_correction,
         event_repeated='drop',
-        reject=reject_criteria,
+        # reject=reject_criteria,
         flat=flat_criteria,
         preload=True,
+        verbose=False,
     )
 
     #epochs.plot_drop_log()

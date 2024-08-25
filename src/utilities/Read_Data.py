@@ -8,6 +8,10 @@ import os
 
 import mne
 from scipy.io import loadmat
+import pickle
+
+from processing.Processing_EEG import process_eeg_raw
+from processing.Processing_NIRS import process_nirs_raw
 
 def read_matlab_file(subject_id, base_path):
     '''Read matlab file and return data'''
@@ -53,6 +57,16 @@ def read_subject_raw_nirs(
         nirs_event_translations={},
         eeg_translation_events_dict={},
         task_stimulous_to_crop={}):
+    '''
+    Read the raw nirs data for a subject
+    input:
+        root_directory (str)
+        tasks_to_do (list of str)
+        trial_to_check (dictionary of lists of str)
+        nirs_event_translations (dictionary of dictionaries)
+        eeg_translation_events_dict (dictionary of dictionaries)
+        task_stimulous_to_crop (dictionary of lists of str)
+    '''
     raw_intensities = []
     counter = 0
 
@@ -116,7 +130,7 @@ def read_subject_raw_nirs(
                     raw_intensity.crop(tmin=crop_tmin, tmax=crop_tmax)
 
                 raw_dict[task_name][session_index] = raw_intensity
-    # something is wrong with the contentation of the nirs vs eeg contentation
+    # something is wrong with the concatination of the nirs vs eeg concatination
 
     for key in raw_dict.keys():
         print(key)
@@ -141,6 +155,15 @@ def read_subject_raw_eeg(
         event_translations,
         task_stimulous_to_crop,
         eeg_coords):
+    '''
+    Read the raw eeg data for a subject
+    input:
+        root_directory (str)
+        tasks_to_do (list of str)
+        event_translations (dictionary of str)
+        task_stimulous_to_crop (dictionary of lists of str)
+        eeg_coords (dictionary of lists of float)
+    '''
     events_dict = {task: {} for task in tasks_to_do}
     raw_voltages_dict = {task: {} for task in tasks_to_do}
     
@@ -209,3 +232,127 @@ def read_subject_raw_eeg(
     raw_eeg_voltage.set_montage(montage)
 
     return raw_eeg_voltage, events_dict
+
+def read_subjects_data(
+        subjects,
+        eeg_root_directory,
+        nirs_root_directory,
+        tasks,
+        eeg_event_translations,
+        nirs_event_translations,
+        eeg_coords,
+        tasks_stimulous_to_crop,
+        trial_to_check_nirs,
+        eeg_t_min=0,
+        eeg_t_max=1,
+        nirs_t_min=0,
+        nirs_t_max=1,
+        eeg_sample_rate=200,
+        redo_preprocessing=False,
+
+):
+    '''Read subject eeg and nirs data
+    input:
+        subjects (list of str)
+        eeg_root_directory (str)
+        nirs_root_directory (str)
+        tasks (list of str)
+        eeg_event_translations (dictionary of dictionaries)
+        nirs_event_translations (dictionary of dictionaries)
+        eeg_coords (dictionary of lists of float)
+        tasks_stimulous_to_crop (dictionary of lists of str)
+        trial_to_check_nirs (dictionary of lists of str)
+        eeg_t_min (float)
+        eeg_t_max (float)
+        nirs_t_min (float)
+        nirs_t_max (float)
+        eeg_sample_rate (int)
+        redo_preprocessing (bool)
+    '''
+    processed_eeg_subject_list = []
+    processed_nirs_subject_list = []
+
+    # Loop for subjects
+    for subject_id in subjects:
+        eeg_pickle_file = os.path.join(eeg_root_directory, subject_id, f'{subject_id}_eeg_processed.pkl')
+        nirs_pickle_file = os.path.join(nirs_root_directory, subject_id, f'{subject_id}_processed.pkl')
+        if (not redo_preprocessing and 
+            (os.path.exists(eeg_pickle_file))
+        ):  
+            # voltage
+            with open(eeg_pickle_file, 'rb') as file:
+                eeg_processed_voltage = pickle.load(file)
+        else:
+            print(f'Starting eeg processing of {subject_id}')
+            raw_eeg_voltage, eeg_events_dict  = read_subject_raw_eeg(
+                os.path.join(eeg_root_directory, subject_id),
+                tasks,
+                eeg_event_translations,
+                tasks_stimulous_to_crop,
+                eeg_coords=eeg_coords)
+            
+            eeg_processed_voltage = process_eeg_raw(
+                raw_eeg_voltage, 
+                eeg_t_min, 
+                eeg_t_max,
+                resample=eeg_sample_rate)
+            
+            print(f'eeg_before: {raw_eeg_voltage.get_data().shape}')
+            print(f'eeg_after: {eeg_processed_voltage.get_data().shape}')
+
+            with open(eeg_pickle_file, 'wb') as file:
+                pickle.dump(eeg_processed_voltage, file, pickle.HIGHEST_PROTOCOL)
+
+        if (not redo_preprocessing and 
+            os.path.exists(nirs_pickle_file)
+        ):
+            with open(nirs_pickle_file, 'rb') as file:
+                nirs_processed_hemoglobin = pickle.load(file)
+        else:
+            print(f'Starting nirs processing of {subject_id}')
+            raw_nirs_intensity, raw_slope_dict = read_subject_raw_nirs(
+                root_directory=os.path.join(nirs_root_directory, subject_id),
+                tasks_to_do=tasks,
+                trial_to_check=trial_to_check_nirs[subject_id],
+                nirs_event_translations=nirs_event_translations,
+                translation_events_dict=eeg_events_dict,
+                task_stimulous_to_crop=tasks_stimulous_to_crop)
+
+            nirs_processed_hemoglobin = process_nirs_raw(
+                raw_nirs_intensity, 
+                nirs_t_min, 
+                nirs_t_max,
+                resample=None)
+
+            print(f'nirs_before: {raw_nirs_intensity.get_data().shape}')
+            print(f'nirs_after: {nirs_processed_hemoglobin.get_data().shape}')
+
+            with open(nirs_pickle_file, 'wb') as file:
+                pickle.dump(nirs_processed_hemoglobin, file, pickle.HIGHEST_PROTOCOL)
+
+        if eeg_processed_voltage.info['sfreq'] != eeg_sample_rate:
+            eeg_processed_voltage.resample(eeg_sample_rate)
+        # if nirs_processed_hemoglobin.info['sfreq'] != fnirs_sample_rate:
+        #     nirs_processed_hemoglobin.resample(fnirs_sample_rate)
+
+        processed_eeg_subject_list.append(eeg_processed_voltage)
+        processed_nirs_subject_list.append(nirs_processed_hemoglobin)
+
+    # Concatenate subjects
+    eeg_processed_voltage = processed_eeg_subject_list[0]
+    if len(processed_eeg_subject_list) > 1:
+        eeg_processed_voltage = mne.concatenate_raws(processed_eeg_subject_list, preload=False).load_data()
+    nirs_processed_hemoglobin = processed_nirs_subject_list[0]
+    if len(processed_nirs_subject_list) > 1:
+        # preload = False because mne was throwing a format error without, load after
+        nirs_processed_hemoglobin = mne.concatenate_raws(processed_nirs_subject_list, preload=False).load_data() 
+
+    events, single_events_dict = mne.events_from_annotations(eeg_processed_voltage)
+    print(f'Final eeg shape: {eeg_processed_voltage.get_data().shape}')
+    print(f'\neeg events: {events.shape}')
+
+    events, single_events_dict = mne.events_from_annotations(nirs_processed_hemoglobin)
+    print(f'Final nirs shape: {nirs_processed_hemoglobin.get_data().shape}')
+    print(f'\nnirs events: {events.shape}')
+
+    return eeg_processed_voltage, nirs_processed_hemoglobin

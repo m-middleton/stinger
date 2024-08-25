@@ -74,6 +74,11 @@ def perform_fpca_over_channels(data, fpca_dict, n_components):
     for i in range(n_channels):
         fpca = fpca_dict[i]
         fdarray = numpy_to_fdarray(data[:, i, :])
+        print(data.shape)
+        print(fdarray.shape)
+        print(n_components)
+        # print fpca size
+        print
         tokenized_data[:, i, :] = fpca.transform(fdarray)
 
     return tokenized_data
@@ -142,7 +147,9 @@ def get_fpca_dict(subject_id,
                   eeg_token_size,
                   model_weights='',
                   nirs_t_min=0,
-                  nirs_t_max=1):
+                  nirs_t_max=1,
+                  eeg_t_min=0,
+                  eeg_t_max=1):
     fpca_dict_path = os.path.join(model_weights, f'fpca_dict_{subject_id}.pkl')
     if not os.path.exists(fpca_dict_path):
         print(f'Building FPCA Dict')
@@ -152,8 +159,8 @@ def get_fpca_dict(subject_id,
                     sampling_rate=200,
                     nirs_t_min=nirs_t_min, 
                     nirs_t_max=nirs_t_max,
-                    eeg_t_min=0, 
-                    eeg_t_max=1)
+                    eeg_t_min=eeg_t_min, 
+                    eeg_t_max=eeg_t_max)
         print(f'EEG FPCA Shape: {eeg_windowed_train.shape}')
         print(f'NIRS FPCA Shape: {nirs_windowed_train.shape}')
         eeg_fpca_dict = fit_fpca_model(eeg_windowed_train, eeg_token_size)
