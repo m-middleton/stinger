@@ -13,7 +13,10 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 import mne
-# from mne import events_from_annotations, concatenate_raws
+from mne_nirs.experimental_design import make_first_level_design_matrix, create_boxcar
+from mne_nirs.statistics import run_glm
+from nilearn.plotting import plot_design_matrix
+
 from sklearn.metrics import r2_score
 
 import torch
@@ -25,6 +28,10 @@ from sklearn.metrics import r2_score
 import torch
 from torch.optim import Adam
 from torch.utils.data import DataLoader
+
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+import tkinter as tk
+from tkinter import ttk
 
 import gc
 
@@ -63,6 +70,61 @@ loss_amounts = {
     'mlp': 0.001,
     'transformer': 0.01
 }
+
+def model_hrf_design_matrix(raw_haemo):
+    design_matrix = make_first_level_design_matrix(
+        raw_haemo,
+        drift_model="cosine",
+        high_pass=0.005,  # Must be specified per experiment
+        hrf_model="spm",
+        stim_dur=5.0,
+    )
+
+    print(f'Design Matrix: {design_matrix.shape}')
+    fig, ax1 = plt.subplots(figsize=(10, 6), constrained_layout=True)
+    fig = plot_design_matrix(design_matrix, ax=ax1)
+    plt.show()
+
+    return design_matrix
+
+def convolve_hrf(raw_haemo, design_matrix):
+    print(f'Plotting HRF')
+    fig, ax = plt.subplots(constrained_layout=True)
+    s = create_boxcar(raw_haemo, stim_dur=5.0)
+    ax.plot(raw_haemo.times, s[:, 1])
+    ax.plot(design_matrix["Tapping_Left"])
+    ax.legend(["Stimulus", "Expected Response"])
+    ax.set(xlim=(180, 300), xlabel="Time (s)", ylabel="Amplitude")
+
+def run_glm(raw_haemo, design_matrix):
+    print(f'Running GLM')
+    data_subset = raw_haemo.copy().pick(picks=range(2))
+    glm_est = run_glm(data_subset, design_matrix)
+    glm_est.to_dataframe().head(9)
+
+def get_hrf(subject_ids):
+    for subject_id in subject_ids:
+        _, raw_haemo = read_subjects_data(
+                subjects=[f'VP{subject_id:03d}'],
+                raw_data_directory=RAW_DIRECTORY,
+                tasks=tasks,
+                eeg_event_translations=EEG_EVENT_TRANSLATIONS,
+                nirs_event_translations=NIRS_EVENT_TRANSLATIONS,
+                eeg_coords=EEG_COORDS,
+                tasks_stimulous_to_crop=TASK_STIMULOUS_TO_CROP,
+                trial_to_check_nirs=TRIAL_TO_CHECK_NIRS,
+                eeg_t_min=eeg_t_min,
+                eeg_t_max=eeg_t_max,
+                nirs_t_min=nirs_t_min,
+                nirs_t_max=nirs_t_max,
+                eeg_sample_rate=eeg_sample_rate,
+                redo_preprocessing=False,
+            )
+        
+        design_matrix = model_hrf_design_matrix(raw_haemo)
+        convolve_hrf(raw_haemo, design_matrix)
+        run_glm(raw_haemo, design_matrix)
+    
 
 def plot_grand_average_matrix(events, channels, grand_average_dict, sampling_rate):
     # plot average erp comparison between mne and manual
@@ -110,8 +172,7 @@ def plot_grand_average():
     for subject in subject_ids:
         eeg_raw_mne, nirs_raw_mne = read_subjects_data(
             subjects=[f'VP{subject:03d}'],
-            eeg_root_directory=ROOT_DIRECTORY_EEG,
-            nirs_root_directory=ROOT_DIRECTORY_NIRS,
+            raw_data_directory=RAW_DIRECTORY,
             tasks=tasks,
             eeg_event_translations=EEG_EVENT_TRANSLATIONS,
             nirs_event_translations=NIRS_EVENT_TRANSLATIONS,
@@ -172,6 +233,107 @@ def plot_grand_average():
     plt.show()
     input('Press Enter to continue...')
 
+
+def plot_erp_matrix(subject_ids,
+                    nirs_test_channels=['AF7', 'C3h'],
+                    eeg_test_channels=['Cz', 'Pz'],
+                    test_events=['2-back non-target', '2-back target']):
+    # Initialize ERP average dictionary
+    erp_average_dict = {'eeg': {}, 'nirs': {}}
+    for signal_name in erp_average_dict.keys():
+        for task_name in test_events:
+            erp_average_dict[signal_name][task_name] = []
+
+    for subject in subject_ids:
+        eeg_raw_mne, nirs_raw_mne = read_subjects_data(
+            subjects=[f'VP{subject:03d}'],
+            raw_data_directory=RAW_DIRECTORY,
+            tasks=tasks,
+            eeg_event_translations=EEG_EVENT_TRANSLATIONS,
+            nirs_event_translations=NIRS_EVENT_TRANSLATIONS,
+            eeg_coords=EEG_COORDS,
+            tasks_stimulous_to_crop=TASK_STIMULOUS_TO_CROP,
+            trial_to_check_nirs=TRIAL_TO_CHECK_NIRS,
+            eeg_t_min=eeg_t_min,
+            eeg_t_max=eeg_t_max,
+            nirs_t_min=nirs_t_min,
+            nirs_t_max=nirs_t_max,
+            eeg_sample_rate=eeg_sample_rate,
+            redo_preprocessing=False,
+        )
+        for signal_name, task_dict in erp_average_dict.items():
+            if signal_name == 'eeg':
+                epochs = process_eeg_epochs(
+                    eeg_raw_mne,
+                    eeg_t_min,
+                    eeg_t_max)
+            elif signal_name == 'nirs':
+                epochs = process_nirs_epochs(
+                    nirs_raw_mne,
+                    eeg_t_min,
+                    eeg_t_max)
+            for task_name in task_dict:
+                erp_average_dict[signal_name][task_name].append(epochs[task_name].average())
+
+    def create_plot(signal_type, test_channels):
+        fig, axs = plt.subplots(len(test_channels), len(subject_ids), figsize=(20, 20))
+        for i, channel in enumerate(test_channels):
+            for j, subject in enumerate(subject_ids):
+                for task_name in test_events:
+                    erp_data = erp_average_dict[signal_type][task_name][j].copy().pick(channel).data.T
+                    times = erp_average_dict[signal_type][task_name][j].times
+                    axs[i, j].plot(times, erp_data, label=task_name)
+                if i == 0:
+                    axs[i, j].set_title(f'{subject}')
+                if j == 0:
+                    axs[i, j].set_ylabel(f'{channel}')
+                if i == 0 and j == 0:
+                    axs[i, j].legend()
+        plt.suptitle(f'{signal_type.upper()} ERP Matrix')
+        return fig
+
+    root = tk.Tk()
+    root.title("ERP Matrix")
+
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill='both', expand=True)
+
+    nirs_channels_to_use_ids = translate_channel_name_to_ch_id(nirs_test_channels, NIRS_COORDS, nirs_raw_mne.ch_names)
+    nirs_test_channels = []
+    for channel_id in nirs_channels_to_use_ids:
+        nirs_test_channels.append(f'{channel_id} hbo')
+        nirs_test_channels.append(f'{channel_id} hbr')
+
+    for signal_type, test_channels in [('eeg', eeg_test_channels), ('nirs', nirs_test_channels)]:
+        frame = ttk.Frame(notebook)
+        notebook.add(frame, text=f'{signal_type.upper()} ERP Matrix')
+
+        fig = create_plot(signal_type, test_channels)
+        canvas = FigureCanvasTkAgg(fig, master=frame)
+        canvas.draw()
+
+        # Create a scrollable frame
+        scrollable_frame = ttk.Frame(frame)
+        scrollable_frame.pack(fill='both', expand=True)
+
+        # Add canvas to scrollable frame
+        canvas_widget = canvas.get_tk_widget()
+        canvas_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        # Add scrollbars
+        x_scrollbar = ttk.Scrollbar(scrollable_frame, orient=tk.HORIZONTAL, command=canvas_widget.xview)
+        y_scrollbar = ttk.Scrollbar(scrollable_frame, orient=tk.VERTICAL, command=canvas_widget.yview)
+        canvas_widget.configure(xscrollcommand=x_scrollbar.set, yscrollcommand=y_scrollbar.set)
+        x_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+        y_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Add toolbar for zooming and panning
+        toolbar = NavigationToolbar2Tk(canvas, frame)
+        toolbar.update()
+        toolbar.pack(side=tk.BOTTOM, fill=tk.X)
+
+    root.mainloop()
+
 def run_model(subject_id_int,
               model_name_base, 
               nirs_channels_to_use_base, 
@@ -195,8 +357,7 @@ def run_model(subject_id_int,
         # eeg_data, nirs_data, mrk_data = read_matlab_file(subject_id, BASE_PATH)
         eeg_raw_mne, nirs_raw_mne = read_subjects_data(
             subjects=[f'VP{subject_id_int:03d}'],
-            eeg_root_directory=ROOT_DIRECTORY_EEG,
-            nirs_root_directory=ROOT_DIRECTORY_NIRS,
+            raw_data_directory=RAW_DIRECTORY,
             tasks=tasks,
             eeg_event_translations=EEG_EVENT_TRANSLATIONS,
             nirs_event_translations=NIRS_EVENT_TRANSLATIONS,
@@ -210,8 +371,6 @@ def run_model(subject_id_int,
             eeg_sample_rate=eeg_sample_rate,
             redo_preprocessing=False,
         )
-
-
 
         mrk_data, single_events_dict = mne.events_from_annotations(eeg_raw_mne)
         reverse_events_dict = {v: k for k, v in single_events_dict.items()}
@@ -650,7 +809,18 @@ def run_model(subject_id_int,
             plt.close()
 
 def main():
-    plot_grand_average()
+    
+    # subject_ids = np.arange(1, 27)  # 1-27
+    subject_ids = [1]
+
+    get_hrf(subject_ids)
+    input('Press Enter to continue...')
+
+    # plot_grand_average()
+    # plot_erp_matrix(subject_ids=subject_ids,
+    #                 nirs_test_channels=list(NIRS_COORDS.keys()),
+    #                 eeg_test_channels=EEG_CHANNEL_NAMES,
+    #                 test_events=['2-back non-target', '2-back target'])
 
     # Define channels to use
     # nirs_channels_to_use_base = list(NIRS_COORDS.keys())
@@ -687,10 +857,10 @@ if __name__ == '__main__':
     # EEG Downsampling rate
     eeg_sample_rate = 200
     # Time window (seconds)
-    eeg_t_min = -1
+    eeg_t_min = -0.5
     eeg_t_max = 1
-    nirs_t_min = -10
-    nirs_t_max = 10
+    nirs_t_min = -0.5
+    nirs_t_max = 1
     offset_t = 0
 
     # Redo preprocessing pickle files, TAKES A LONG TIME 

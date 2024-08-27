@@ -235,8 +235,7 @@ def read_subject_raw_eeg(
 
 def read_subjects_data(
         subjects,
-        eeg_root_directory,
-        nirs_root_directory,
+        raw_data_directory,
         tasks,
         eeg_event_translations,
         nirs_event_translations,
@@ -272,62 +271,62 @@ def read_subjects_data(
     processed_eeg_subject_list = []
     processed_nirs_subject_list = []
 
+    eeg_raw_directory = os.path.join(raw_data_directory, 'eeg')
+    nirs_raw_directory = os.path.join(raw_data_directory, 'nirs')
+    processed_directory = os.path.join(raw_data_directory, 'processed')
+
     # Loop for subjects
     for subject_id in subjects:
-        eeg_pickle_file = os.path.join(eeg_root_directory, subject_id, f'{subject_id}_eeg_processed.pkl')
-        nirs_pickle_file = os.path.join(nirs_root_directory, subject_id, f'{subject_id}_processed.pkl')
+        eeg_pickle_file_path = os.path.join(processed_directory, f'{subject_id}_eeg_processed.pkl')
+        nirs_pickle_file_path = os.path.join(processed_directory, f'{subject_id}_nirs_processed.pkl')
         if (not redo_preprocessing and 
-            (os.path.exists(eeg_pickle_file))
+            (os.path.exists(eeg_pickle_file_path))
         ):  
             # voltage
-            with open(eeg_pickle_file, 'rb') as file:
+            with open(eeg_pickle_file_path, 'rb') as file:
                 eeg_processed_voltage = pickle.load(file)
         else:
             print(f'Starting eeg processing of {subject_id}')
             raw_eeg_voltage, eeg_events_dict  = read_subject_raw_eeg(
-                os.path.join(eeg_root_directory, subject_id),
-                tasks,
-                eeg_event_translations,
-                tasks_stimulous_to_crop,
+                root_directory=os.path.join(eeg_raw_directory, subject_id), 
+                tasks_to_do=tasks, 
+                event_translations=eeg_event_translations,
+                task_stimulous_to_crop=tasks_stimulous_to_crop,
                 eeg_coords=eeg_coords)
             
-            eeg_processed_voltage = process_eeg_raw(
-                raw_eeg_voltage, 
-                eeg_t_min, 
-                eeg_t_max,
-                resample=eeg_sample_rate)
+            eeg_processed_voltage = process_eeg_raw(raw_eeg_voltage, 
+                                                    l_freq=None, 
+                                                    h_freq=80, 
+                                                    resample=eeg_sample_rate)
             
             print(f'eeg_before: {raw_eeg_voltage.get_data().shape}')
             print(f'eeg_after: {eeg_processed_voltage.get_data().shape}')
 
-            with open(eeg_pickle_file, 'wb') as file:
+            with open(eeg_pickle_file_path, 'wb') as file:
                 pickle.dump(eeg_processed_voltage, file, pickle.HIGHEST_PROTOCOL)
 
         if (not redo_preprocessing and 
-            os.path.exists(nirs_pickle_file)
+            os.path.exists(nirs_pickle_file_path)
         ):
-            with open(nirs_pickle_file, 'rb') as file:
+            with open(nirs_pickle_file_path, 'rb') as file:
                 nirs_processed_hemoglobin = pickle.load(file)
         else:
             print(f'Starting nirs processing of {subject_id}')
-            raw_nirs_intensity, raw_slope_dict = read_subject_raw_nirs(
-                root_directory=os.path.join(nirs_root_directory, subject_id),
-                tasks_to_do=tasks,
-                trial_to_check=trial_to_check_nirs[subject_id],
-                nirs_event_translations=nirs_event_translations,
-                translation_events_dict=eeg_events_dict,
-                task_stimulous_to_crop=tasks_stimulous_to_crop)
+            raw_nirs_intensity = read_subject_raw_nirs(
+                    root_directory=os.path.join(nirs_raw_directory, subject_id),
+                    tasks_to_do=tasks,
+                    trial_to_check=trial_to_check_nirs[subject_id], 
+                    nirs_event_translations=nirs_event_translations,
+                    eeg_translation_events_dict=eeg_events_dict,
+                    task_stimulous_to_crop=tasks_stimulous_to_crop)
 
-            nirs_processed_hemoglobin = process_nirs_raw(
-                raw_nirs_intensity, 
-                nirs_t_min, 
-                nirs_t_max,
-                resample=None)
+            nirs_processed_hemoglobin = process_nirs_raw(raw_nirs_intensity, 
+                                                         resample=None)
 
             print(f'nirs_before: {raw_nirs_intensity.get_data().shape}')
             print(f'nirs_after: {nirs_processed_hemoglobin.get_data().shape}')
 
-            with open(nirs_pickle_file, 'wb') as file:
+            with open(nirs_pickle_file_path, 'wb') as file:
                 pickle.dump(nirs_processed_hemoglobin, file, pickle.HIGHEST_PROTOCOL)
 
         if eeg_processed_voltage.info['sfreq'] != eeg_sample_rate:

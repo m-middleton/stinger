@@ -3,8 +3,9 @@ from os.path import join
 BASE_PATH = '../data/'
 # BASE_PATH = '../../data/'
 
-ROOT_DIRECTORY_EEG = join(BASE_PATH, 'raw/eeg/')
-ROOT_DIRECTORY_NIRS = join(BASE_PATH, 'raw/nirs/')
+RAW_DIRECTORY = join(BASE_PATH, 'raw/')
+ROOT_DIRECTORY_EEG = join(RAW_DIRECTORY, 'eeg/')
+ROOT_DIRECTORY_NIRS = join(RAW_DIRECTORY, 'nirs/')
 MODEL_WEIGHTS = join(BASE_PATH, 'model_weights/')
 OUTPUT_DIRECTORY = join(BASE_PATH, 'output/')
 
@@ -243,7 +244,7 @@ NIRS_COORDS = {
 
 # EEG Channels names
 EEG_CHANNEL_NAMES = ['FP1', 
-                    'AFF5h', 
+                    'AFF5', #AFF5h
                     'AFz', 
                     'F1', 
                     'FC5', 
@@ -259,7 +260,7 @@ EEG_CHANNEL_NAMES = ['FP1',
                     'POz', 
                     'O1',  
                     'FP2', 
-                    'AFF6h',
+                    'AFF6', #AFF6h
                     'F2', 
                     'FC2', 
                     'FC6', 
@@ -270,8 +271,9 @@ EEG_CHANNEL_NAMES = ['FP1',
                     'P4', 
                     'P8', 
                     'O2',
-                    'HEOG',
-                    'VEOG']
+                    #'HEOG',
+                    #'VEOG',
+                    ]
 
 
 # Fake source detector IDS
