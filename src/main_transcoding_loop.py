@@ -89,8 +89,14 @@ def model_hrf_design_matrix(raw_haemo):
 
 def convolve_hrf(raw_haemo, design_matrix):
     print(f'Plotting HRF')
+    print(f'Haemo Size: {raw_haemo.get_data().shape}')
+    events, single_events_dict = mne.events_from_annotations(raw_haemo)
+    print(f'Event Times: {events[:-5]}')
+
     fig, ax = plt.subplots(constrained_layout=True)
-    s = create_boxcar(raw_haemo, stim_dur=5.0)
+    s = create_boxcar(raw_haemo, stim_dur=0.4)
+    print(f's type: {type(s)}')
+    print(f's: {np.shape(s)}')
     ax.plot(raw_haemo.times, s[:, 1])
     ax.plot(design_matrix["Tapping_Left"])
     ax.legend(["Stimulus", "Expected Response"])
@@ -118,10 +124,21 @@ def get_hrf(subject_ids):
                 nirs_t_min=nirs_t_min,
                 nirs_t_max=nirs_t_max,
                 eeg_sample_rate=eeg_sample_rate,
-                redo_preprocessing=False,
+                redo_preprocessing=True,
             )
         
-        design_matrix = model_hrf_design_matrix(raw_haemo)
+        print(f'Shape samples: {raw_haemo.get_data().shape}')
+        events, single_events_dict = mne.events_from_annotations(raw_haemo)
+        print(f'Event Times full: {events[-5:]}')
+        aasdasds=asdasd
+        path_to_design_matrix = os.path.join(OUTPUT_DIRECTORY, f'design_matrix_{subject_id}.csv')
+        if not os.path.exists(path_to_design_matrix):
+            design_matrix = model_hrf_design_matrix(raw_haemo)
+            design_matrix.to_csv(path_to_design_matrix)
+        else:
+            print(f'Design Matrix exists, skipping {subject_id}')
+            design_matrix = pd.read_csv(path_to_design_matrix)
+
         convolve_hrf(raw_haemo, design_matrix)
         run_glm(raw_haemo, design_matrix)
     
@@ -334,6 +351,74 @@ def plot_erp_matrix(subject_ids,
 
     root.mainloop()
 
+def plot_erp(eeg_epochs, test_events, test_channels):
+    # plot average erp comparison between mne and manual
+    fig, axs = plt.subplots(len(test_events), len(test_channels), figsize=(10, 10))
+    print(np.shape(axs))
+    times = None
+    for event_name in test_events:
+        for channel in test_channels:
+            epoch_eeg_select = eeg_epochs.copy().pick(channel)
+            # non-target
+            non_erp =  epoch_eeg_select[f'{event_name} non-target']
+            times = non_erp.times
+            non_erp = non_erp.average().data.T
+            # target
+            target_erp = epoch_eeg_select[f'{event_name} target'].average().data.T
+            # non-target - target
+            difference_erp = non_erp - target_erp
+            # plot
+            axs[test_events.index(event_name), test_channels.index(channel)].plot(times, non_erp, label='Non-Target')
+            axs[test_events.index(event_name), test_channels.index(channel)].plot(times, target_erp, label='Target')
+            axs[test_events.index(event_name), test_channels.index(channel)].plot(times, difference_erp, label='N-T')
+
+            if test_events.index(event_name) == 0:
+                axs[test_events.index(event_name), test_channels.index(channel)].set_title(f'{channel}')
+            if test_channels.index(channel) == 0:
+                axs[test_events.index(event_name), test_channels.index(channel)].set_ylabel(f'{event_name}')
+
+            # if test_events.index(event_name) == 0 and test_channels.index(channel) == 0:
+            axs[test_events.index(event_name), test_channels.index(channel)].legend()
+
+def plot_erp_comparison(eeg_data, mrk_data, eeg_epochs, test_events, test_channels, single_events_dict):
+    fig, axs = plt.subplots(len(test_events), len(test_channels), figsize=(20, 15))
+    
+    # Calculate ERP from extracted data
+    for event_idx, event_name in enumerate(test_events):
+        event_indices = mrk_data[mrk_data[:, 2] == single_events_dict[event_name], 0]
+        
+        for channel_idx, channel in enumerate(test_channels):
+            channel_data = eeg_data[EEG_CHANNEL_NAMES.index(channel)]
+            
+            # Extract epochs
+            epochs = []
+            for event_time in event_indices:
+                start = int(event_time + eeg_t_min * eeg_sample_rate)
+                end = int(event_time + eeg_t_max * eeg_sample_rate)
+                if start >= 0 and end < channel_data.shape[0]:
+                    epochs.append(channel_data[start:end])
+            
+            # Calculate ERP
+            erp = np.mean(epochs, axis=0)
+            times = np.linspace(eeg_t_min, eeg_t_max, erp.shape[0])
+            
+            # Plot ERP from extracted data
+            axs[event_idx, channel_idx].plot(times, erp, label='Extracted')
+            axs[event_idx, channel_idx].set_title(f'{event_name} - {channel} (Extracted)')
+            
+            # Plot ERP from MNE epoched object
+            evoked = eeg_epochs[event_name].average().pick(channel)
+            axs[event_idx, channel_idx].plot(evoked.times, evoked.data.T, label='MNE')
+            axs[event_idx, channel_idx].set_title(f'{event_name} - {channel} (MNE)')
+            
+            axs[event_idx, channel_idx].set_xlabel('Time (s)')
+            axs[event_idx, channel_idx].set_ylabel('Amplitude')
+            axs[event_idx, channel_idx].legend()
+            axs[event_idx, channel_idx].grid(True)
+    
+    plt.tight_layout()
+    plt.show()
+    
 def run_model(subject_id_int,
               model_name_base, 
               nirs_channels_to_use_base, 
@@ -372,90 +457,21 @@ def run_model(subject_id_int,
             redo_preprocessing=False,
         )
 
+        #remove HEOG and VEOG
+        eeg_raw_mne.drop_channels(['HEOG', 'VEOG'])
+        # get only hbo
+        nirs_raw_mne.pick(picks='hbo')
+
         mrk_data, single_events_dict = mne.events_from_annotations(eeg_raw_mne)
-        reverse_events_dict = {v: k for k, v in single_events_dict.items()}
-        test_events = ['2-back',
-                        '3-back']
-        test_channels = ['Pz',
-                    'Cz',]
-        
+        mrk_data[:,0] -= mrk_data[0,0]
+        mrk_data[:,0] += (1*eeg_sample_rate)
         print(single_events_dict)
-
-        eeg_epochs = process_eeg_epochs(
-                eeg_raw_mne, 
-                eeg_t_min,
-                eeg_t_max)
         
-        # plot average erp comparison between mne and manual
-        fig, axs = plt.subplots(len(test_events), len(test_channels), figsize=(10, 10))
-        print(np.shape(axs))
-        times = None
-        for event_name in test_events:
-            for channel in test_channels:
-                epoch_eeg_select = eeg_epochs.copy().pick(channel)
-                # non-target
-                non_erp =  epoch_eeg_select[f'{event_name} non-target']
-                times = non_erp.times
-                non_erp = non_erp.average().data.T
-                # target
-                target_erp = epoch_eeg_select[f'{event_name} target'].average().data.T
-                # non-target - target
-                difference_erp = non_erp - target_erp
-                # plot
-                axs[test_events.index(event_name), test_channels.index(channel)].plot(times, non_erp, label='Non-Target')
-                axs[test_events.index(event_name), test_channels.index(channel)].plot(times, target_erp, label='Target')
-                axs[test_events.index(event_name), test_channels.index(channel)].plot(times, difference_erp, label='N-T')
-
-                if test_events.index(event_name) == 0:
-                    axs[test_events.index(event_name), test_channels.index(channel)].set_title(f'{channel}')
-                if test_channels.index(channel) == 0:
-                    axs[test_events.index(event_name), test_channels.index(channel)].set_ylabel(f'{event_name}')
-
-                # if test_events.index(event_name) == 0 and test_channels.index(channel) == 0:
-                axs[test_events.index(event_name), test_channels.index(channel)].legend()
-
-        # eeg_data = eeg_raw_mne.get_data()
-        # nirs_data = nirs_raw_mne.get_data()
-        # print(f'EEG Shape: {eeg_data.shape}') # n_channels x n_samples_eeg
-        # print(f'NIRS Shape: {nirs_data.shape}') # n_channels x n_samples_nirs
-        # print(f'MRK Shape: {mrk_data.shape}') # n_events x 3 (timestamp, event_type, event_id)
-            
-        # Get channel index for Cz from EEG_COORDS dict
-        # test_event_ids = [single_events_dict[event] for event in test_events]
-        # channel_index = EEG_CHANNEL_NAMES.index(test_channel)
-        # channel_index = 0
-
-        # test_eeg_data = eeg_raw_mne.copy().pick_channels([test_channel]).get_data()
-        # print(f'single channel shape {test_eeg_data.shape}')
-        # # plot eeg erp around each event id manually
-        # for event_id in test_event_ids:
-        #     event_id = int(event_id)
-        #     event_data = mrk_data[mrk_data[:,2] == event_id]
-        #     print(f'Event shape {event_data.shape}')
-
-        #     event_list = []
-        #     for event in event_data:
-        #         eeg_samples_min = event[0] + (eeg_t_min*eeg_sample_rate)
-        #         eeg_samples_max = event[0] + (eeg_t_max*eeg_sample_rate)
-        #         # Get baseline
-        #         baseline = test_eeg_data[:, eeg_samples_min:event[0]]
-        #         event_data = test_eeg_data[:, eeg_samples_min:eeg_samples_max+1]
-        #         corrected_data = event_data - np.mean(baseline, axis=1).reshape(-1, 1)
-        #         event_list.append(corrected_data)
-        #     single_erp_data = np.array(event_list)
-
-        #     mean_data = np.mean(single_erp_data[:,channel_index,:], axis=0)
-        #     print(f'ERP manual {single_erp_data.shape}')
-        #     print(f'ERP manual {mean_data.shape}')
-
-        #     axs[1].plot(times, mean_data)
-        #     axs[1].set_title(f'EEG ERP for Event ID: {event_id}')
-        #     print(f'Event ID: {reverse_events_dict[event_id]}')
-
-        plt.show()
-
-        input('Press Enter to continue...')
-        asdasd=asdasd
+        eeg_data = eeg_raw_mne.get_data()
+        nirs_data = nirs_raw_mne.get_data()
+        print(f'EEG Shape: {eeg_data.shape}') # n_channels x n_samples_eeg
+        print(f'NIRS Shape: {nirs_data.shape}') # n_channels x n_samples_nirs
+        print(f'MRK Shape: {mrk_data.shape}') # n_events x 3 (timestamp, event_type, event_id)
 
         # split train and test on eeg_data, nirs_data, and mrk_data
         test_size = int(eeg_data.shape[1]*test_size_in_subject)
@@ -463,11 +479,23 @@ def run_model(subject_id_int,
 
         train_eeg_data = eeg_data[:, :train_size]
         train_nirs_data = nirs_data[:, :train_size]
-        # train_mrk_data = mrk_data[:, :train_size]
 
-        test_eeg_data = eeg_data[:, train_size:]
-        test_nirs_data = nirs_data[:, train_size:]
-        # test_mrk_data = mrk_data[:, train_size:]
+        test_eeg_data = eeg_data[:, test_size:]
+        test_nirs_data = nirs_data[:, test_size:]
+
+        # Calculate train and test mrk_data
+        train_max_event_timestamp = train_eeg_data.shape[1]
+        # MRK (timestamp, event_type, event_id)
+        train_mrk_data = np.array([event for event in mrk_data if event[0] < train_max_event_timestamp])
+        test_mrk_data = np.array([event for event in mrk_data if event[0] >= train_max_event_timestamp])
+
+        print(train_mrk_data[:5])
+        print(f'Train EEG Shape: {train_eeg_data.shape}')
+        print(f'Train NIRS Shape: {train_nirs_data.shape}')
+        print(f'Train MRK Shape: {train_mrk_data.shape}')
+        print(f'Test EEG Shape: {test_eeg_data.shape}')
+        print(f'Test NIRS Shape: {test_nirs_data.shape}')
+        print(f'Test MRK Shape: {test_mrk_data.shape}')
 
         # get CA dict
         # cca_dict = get_cca_dict(subject_id, train_nirs_data, train_eeg_data, token_size)
@@ -485,8 +513,14 @@ def run_model(subject_id_int,
         nirs_fpcas = fpca_dict['nirs']
 
         # plot variance explained
-        plot_explained_variance_over_dict(nirs_fpcas, path=os.path.join(OUTPUT_DIRECTORY, f'variance_{model_name}_nirs_fpca.jpeg'), channel_names=nirs_channels_to_use_base)
-        plot_explained_variance_over_dict(eeg_fpcas, path=os.path.join(OUTPUT_DIRECTORY, f'variance_{model_name}_eeg_fpca.jpeg'), channel_names=eeg_channels_to_use)
+        plot_explained_variance_over_dict(
+            nirs_fpcas, 
+            path=os.path.join(OUTPUT_DIRECTORY, f'variance_{model_name}_nirs_fpca.jpeg'), 
+            channel_names=nirs_channels_to_use_base)
+        plot_explained_variance_over_dict(
+            eeg_fpcas, 
+            path=os.path.join(OUTPUT_DIRECTORY, f'variance_{model_name}_eeg_fpca.jpeg'), 
+            channel_names=eeg_channels_to_use)
 
         # Train data
         eeg_windowed_train, nirs_windowed_train, meta_data = grab_random_windows(
@@ -808,13 +842,49 @@ def run_model(subject_id_int,
             fig.savefig(os.path.join(OUTPUT_DIRECTORY, f'test_{highest_r2:.4f}_{model_name}_{weight_epoch}.jpeg'))
             plt.close()
 
+            # Test predicted vs real ERP from test_mrk
+            
+            # Get test indexes from test_events
+            test_events = ['2-back non-target', '2-back target']
+            test_indexes = [event_timestamp for event_timestamp, event_type, event_id in test_mrk_data if single_events_dict[event_type] in test_events]
+
+            fig, axs = plt.subplots(len(eeg_channels_to_use), 1, figsize=(18, 100))
+            for i in range(len(eeg_channels_to_use)):
+                real_data = targets[:,:,i]
+                real_erp = real_data[(real_data[:,0] >= -0.5) & (real_data[:,0] <= 1)]
+                real_erp = np.mean(real_erp, axis=0)
+
+                predicted_data = predictions[:,:,i]
+                predicted_erp = predicted_data[(predicted_data[:,0] >= -0.5) & (predicted_data[:,0] <= 1)]
+                predicted_erp = np.mean(predicted_erp, axis=0)
+
+                axs[i].plot(real_erp, label='Real')
+                axs[i].plot(predicted_erp, label='Predicted')
+                axs[i].legend()
+                axs[i].set_title(f'{eeg_channels_to_use[i]}')
+            fig.savefig(os.path.join(OUTPUT_DIRECTORY, f'test_{highest_r2:.4f}_{model_name}_{weight_epoch}_erp.jpeg'))
+            plt.close()
+
+            # plot scatter between timepoints in predicted vs real
+            fig, axs = plt.subplots(len(eeg_channels_to_use), 1, figsize=(18, 100))
+            for i in range(len(eeg_channels_to_use)):
+                real_data = targets[:,:,i]
+                predicted_data = predictions[:,:,i]
+
+                axs[i].scatter(real_data, predicted_data)
+                axs[i].set_xlabel('Real')
+                axs[i].set_ylabel('Predicted')
+                axs[i].set_title(f'{eeg_channels_to_use[i]}')
+            fig.savefig(os.path.join(OUTPUT_DIRECTORY, f'test_{highest_r2:.4f}_{model_name}_{weight_epoch}_scatter.jpeg'))
+            plt.close()
+
 def main():
     
     # subject_ids = np.arange(1, 27)  # 1-27
-    subject_ids = [1]
+    # subject_ids = [1]
 
-    get_hrf(subject_ids)
-    input('Press Enter to continue...')
+    # get_hrf(subject_ids)
+    # input('Press Enter to continue...')
 
     # plot_grand_average()
     # plot_erp_matrix(subject_ids=subject_ids,
@@ -823,24 +893,24 @@ def main():
     #                 test_events=['2-back non-target', '2-back target'])
 
     # Define channels to use
-    # nirs_channels_to_use_base = list(NIRS_COORDS.keys())
-    # nirs_channel_index = find_indices(list(NIRS_COORDS.keys()),nirs_channels_to_use_base)
+    nirs_channels_to_use_base = list(NIRS_COORDS.keys())
+    nirs_channel_index = find_indices(list(NIRS_COORDS.keys()),nirs_channels_to_use_base)
 
-    # eeg_channels_to_use = EEG_CHANNEL_NAMES
-    # eeg_channel_index = find_indices(EEG_CHANNEL_NAMES,eeg_channels_to_use)
+    eeg_channels_to_use = EEG_CHANNEL_NAMES
+    eeg_channel_index = find_indices(EEG_CHANNEL_NAMES,eeg_channels_to_use)
 
-    # for subject_id_int in subject_ids[8:]:
-    #     for model_name_base in ['rnn', 'mlp']:
-    #         run_model(subject_id_int, 
-    #                 model_name_base, 
-    #                 nirs_channels_to_use_base, 
-    #                 eeg_channels_to_use, 
-    #                 eeg_channel_index, 
-    #                 nirs_channel_index, 
-    #                 num_epochs, 
-    #                 redo_train=False)
-    #         gc.collect()
-    #         torch.cuda.empty_cache()
+    for subject_id_int in subject_ids:
+        for model_name_base in ['rnn', 'mlp']:
+            run_model(subject_id_int, 
+                    model_name_base, 
+                    nirs_channels_to_use_base, 
+                    eeg_channels_to_use, 
+                    eeg_channel_index, 
+                    nirs_channel_index, 
+                    num_epochs, 
+                    redo_train=False)
+            gc.collect()
+            torch.cuda.empty_cache()
 
 if __name__ == '__main__':
     ## Subject/Trial Parameters ##
@@ -875,7 +945,7 @@ if __name__ == '__main__':
     eeg_lookback = 200
 
     # training loop
-    num_epochs = 1000
+    num_epochs = 100
     test_size_in_subject = 0.2 # percent of test data
 
     main()

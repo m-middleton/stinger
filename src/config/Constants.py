@@ -271,8 +271,8 @@ EEG_CHANNEL_NAMES = ['FP1',
                     'P4', 
                     'P8', 
                     'O2',
-                    #'HEOG',
-                    #'VEOG',
+                    # 'HEOG',
+                    # 'VEOG',
                     ]
 
 

@@ -101,9 +101,10 @@ def read_subject_raw_nirs(
                     lr = linregress(eeg_time, fnirs_time)
                     m_1=lr.slope
                     c_1=lr.intercept
+    
+                    events, single_events_dict = mne.events_from_annotations(raw_intensity)
 
                     # Add translated eeg events
-                    # check_not_same_events = np.logical_not(check_not_same_events)
                     eeg_events_tmp = eeg_events.copy()
                     new_fnirs_events = ((eeg_events_tmp[:,0]/1000)*m_1)+c_1
                     new_fnirs_events = new_fnirs_events*raw_intensity.info['sfreq']
@@ -111,23 +112,24 @@ def read_subject_raw_nirs(
 
                     reversed_event_translations = {v: k for k, v in event_translations.items()}
                     annotation = mne.annotations_from_events(eeg_events_tmp, raw_intensity.info['sfreq'], event_desc=reversed_event_translations)
-                    raw_intensity.set_annotations(annotation)
+                    raw_intensity = raw_intensity.set_annotations(annotation)
 
-                    # Crop to first - last event
-                    events, single_events_dict = mne.events_from_annotations(raw_intensity)
-                    crop_ids = [single_events_dict[i] for i in task_stimulous_to_crop[task_name]]
-                    # crop_ids = [event_translations[i] for i in task_stimulous_to_crop[task_name] if i in event_translations.keys()]
+                    # Get crop IDs
+                    crop_ids = [event_translations[i] for i in task_stimulous_to_crop[task_name]]
+                    crop_index_start = np.array(np.where(np.isin(eeg_events_tmp[:,2], crop_ids))).min()
+                    crop_index_end = np.array(np.where(np.isin(eeg_events_tmp[:,2], crop_ids))).max()
 
-                    # Crop to first-last event
-                    crop_index_start = np.array(np.where(np.isin(events[:,2], crop_ids))).min()
-                    crop_tmin = events[crop_index_start][0]/raw_intensity.info['sfreq']
+                    # Crop events to first - last event
+                    eeg_events_tmp = eeg_events_tmp[crop_index_start:crop_index_end+1]
+
+                    # Crop time to first-last event
+                    crop_tmin = eeg_events_tmp[0][0]/raw_intensity.info['sfreq']
                     crop_tmin -= 1
-                    crop_index_end = np.array(np.where(np.isin(events[:,2], crop_ids))).max()
-                    crop_tmax = events[crop_index_end][0]/raw_intensity.info['sfreq']
+                    crop_tmax = eeg_events_tmp[-1][0]/raw_intensity.info['sfreq']
                     # Adjust for tmin
                     crop_tmax += 40 + 1
 
-                    raw_intensity.crop(tmin=crop_tmin, tmax=crop_tmax)
+                    raw_intensity = raw_intensity.crop(tmin=crop_tmin, tmax=crop_tmax, verbose=True)
 
                 raw_dict[task_name][session_index] = raw_intensity
     # something is wrong with the concatination of the nirs vs eeg concatination
@@ -144,9 +146,9 @@ def read_subject_raw_nirs(
         for session_number in session_order:
             raw_intensity = raw_dict[task_name][session_number]
             raw_intensities.append(raw_intensity)
-            
 
     raw_intensities = mne.concatenate_raws(raw_intensities)
+    
     return raw_intensities
 
 def read_subject_raw_eeg(

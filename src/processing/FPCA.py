@@ -74,11 +74,6 @@ def perform_fpca_over_channels(data, fpca_dict, n_components):
     for i in range(n_channels):
         fpca = fpca_dict[i]
         fdarray = numpy_to_fdarray(data[:, i, :])
-        print(data.shape)
-        print(fdarray.shape)
-        print(n_components)
-        # print fpca size
-        print
         tokenized_data[:, i, :] = fpca.transform(fdarray)
 
     return tokenized_data
@@ -125,7 +120,6 @@ def plot_explained_variance_over_dict(fpca_dict, channel_names, path=''):
     input:
         fpca_dict (dictionary over channels of fit fpca object)
     '''
-    explained_variance = []
 
     fig, axs = plt.subplots(len(fpca_dict), 1, figsize=(10, 50))
     for i in range(len(fpca_dict)):
