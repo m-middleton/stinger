@@ -106,7 +106,7 @@ def rolling_correlation(X, X_pred, chan_labels, offset, sampling_frequency, time
             lc.set_array(cor.ravel())  # Color the lines by the correlation
         elif 'color' in color:
             # opacity = 0.5
-            lc = LineCollection(segments, color=color['color'], norm=norm, linewidth=1, label='Predicted', alpha=0.8)
+            lc = LineCollection(segments, color=color['color'], norm=norm, linewidth=1, label='Predicted', alpha=0.5)
 
         ax.add_collection(lc, autolim=True)
     ax.set_yticks(offset * np.arange(X.shape[0]))
@@ -128,4 +128,6 @@ def rolling_correlation(X, X_pred, chan_labels, offset, sampling_frequency, time
         plt.colorbar(lc, ax=ax, label='Correlation')
     plt.tight_layout()
 
-    return ax.get_figure()
+    average_correlation = np.mean(cor)
+
+    return ax.get_figure(), average_correlation

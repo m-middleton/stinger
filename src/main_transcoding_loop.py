@@ -1,55 +1,41 @@
 '''
 
 '''
-
 import sys
 sys.path.insert(1, '../')
 
 import os
-import joblib
+import csv
+import gc
+import random
+import json
+from datetime import datetime
 
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
-
 import mne
-from mne_nirs.experimental_design import make_first_level_design_matrix, create_boxcar
-from mne_nirs.statistics import run_glm
-from nilearn.plotting import plot_design_matrix
 
-from sklearn.metrics import r2_score
-
-import torch
-from torch.utils.data import DataLoader
-
-import csv
-from sklearn.metrics import r2_score
+import multiprocessing as mp
+from functools import partial
 
 import torch
 from torch.optim import Adam
 from torch.utils.data import DataLoader
+from sklearn.metrics import r2_score
+import torch.nn as nn
 
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-import tkinter as tk
-from tkinter import ttk
-
-import gc
-
-from config.Constants import *
+import wandb
 
 from processing.Format_Data import grab_ordered_windows, grab_random_windows, find_indices, EEGfNIRSData
-from processing.FPCA import perform_fpca_over_channels, get_fpca_dict, plot_explained_variance_over_dict
-from processing.CCA import perform_cca_over_channels, get_cca_dict
-
-from utilities.Read_Data import read_matlab_file, read_subjects_data
-from utilities.Model_Utilities import predict_eeg, create_rnn, create_mlp, create_transformer
-from utilities.utilities import translate_channel_name_to_ch_id
-
+from processing.FPCA import MultiChannelFPCA
+from utilities.Read_Data import read_subjects_data
+from models.Model_Utilities import predict_eeg, create_rnn, create_mlp, create_transformer
+from utilities.utilities import calculate_channel_distances
+from utilities.Plotting import plot_scatter_between_timepoints, compare_real_vs_predicted_erp, process_channel_rolling_correlation
 from plotting.Windowed_Correlation import rolling_correlation
 
-from processing.Processing_EEG import process_eeg_epochs
-from processing.Processing_NIRS import process_nirs_epochs
-
+from config.Constants import *
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f'Device: {DEVICE}')
@@ -65,823 +51,740 @@ model_functions = {
     'mlp': create_mlp,
     'transformer': create_transformer
 }
-loss_amounts = {
-    'rnn': 0.01,
-    'mlp': 0.001,
-    'transformer': 0.01
-}
 
-def model_hrf_design_matrix(raw_haemo):
-    design_matrix = make_first_level_design_matrix(
-        raw_haemo,
-        drift_model="cosine",
-        high_pass=0.005,  # Must be specified per experiment
-        hrf_model="spm",
-        stim_dur=5.0,
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def save_config(
+        subject_id, 
+        model_config, 
+        data_config, 
+        training_config, 
+        visualization_config
+):
+    # Convert all config values to strings
+    def stringify_config(config):
+        if isinstance(config, dict):
+            return {k: stringify_config(v) for k, v in config.items()}
+        elif isinstance(config, list):
+            return [stringify_config(item) for item in config]
+        else:
+            return str(config)
+
+    model_config = stringify_config(model_config)
+    data_config = stringify_config(data_config)
+    training_config = stringify_config(training_config)
+    visualization_config = stringify_config(visualization_config)
+
+    # Create a dictionary containing all configurations
+    config = {
+        "subject_id": subject_id,
+        "model_config": model_config,
+        "data_config": data_config,
+        "training_config": training_config,
+        "visualization_config": visualization_config
+    }
+    
+    # Get the output path from visualization_config
+    output_path = visualization_config['output_path']
+    
+    # Create a filename for the config log
+    config_filename = f"config_log_subject_{subject_id}.json"
+    
+    # Full path for the config log file
+    config_file_path = os.path.join(output_path, config_filename)
+    
+    # Save the config dictionary as a JSON file
+    with open(config_file_path, 'w') as f:
+        json.dump(config, f, indent=4)
+    
+    print(f"Configuration saved to: {config_file_path}")
+
+def get_data(subject_id_int, data_config, training_config):
+
+    # Read and preprocess data
+    eeg_raw_mne, nirs_raw_mne = read_subjects_data(
+        subjects=[f'VP{subject_id_int:03d}'],
+        raw_data_directory=RAW_DIRECTORY,
+        tasks=data_config['tasks'],
+        eeg_event_translations=EEG_EVENT_TRANSLATIONS,
+        nirs_event_translations=NIRS_EVENT_TRANSLATIONS,
+        eeg_coords=EEG_COORDS,
+        tasks_stimulous_to_crop=TASK_STIMULOUS_TO_CROP,
+        trial_to_check_nirs=TRIAL_TO_CHECK_NIRS,
+        eeg_t_min=data_config['eeg_t_min'],
+        eeg_t_max=data_config['eeg_t_max'],
+        nirs_t_min=data_config['nirs_t_min'],
+        nirs_t_max=data_config['nirs_t_max'],
+        eeg_sample_rate=data_config['eeg_sample_rate'],
+        redo_preprocessing=False,
     )
 
-    print(f'Design Matrix: {design_matrix.shape}')
-    fig, ax1 = plt.subplots(figsize=(10, 6), constrained_layout=True)
-    fig = plot_design_matrix(design_matrix, ax=ax1)
-    plt.show()
+    fnirs_sample_rate = nirs_raw_mne.info['sfreq']
 
-    return design_matrix
+    #remove HEOG and VEOG
+    eeg_raw_mne.drop_channels(['HEOG', 'VEOG'])
+    # get only hbo
+    nirs_raw_mne.pick(picks='hbo')
 
-def convolve_hrf(raw_haemo, design_matrix):
-    print(f'Plotting HRF')
-    print(f'Haemo Size: {raw_haemo.get_data().shape}')
-    events, single_events_dict = mne.events_from_annotations(raw_haemo)
-    print(f'Event Times: {events[:-5]}')
-
-    fig, ax = plt.subplots(constrained_layout=True)
-    s = create_boxcar(raw_haemo, stim_dur=0.4)
-    print(f's type: {type(s)}')
-    print(f's: {np.shape(s)}')
-    ax.plot(raw_haemo.times, s[:, 1])
-    ax.plot(design_matrix["Tapping_Left"])
-    ax.legend(["Stimulus", "Expected Response"])
-    ax.set(xlim=(180, 300), xlabel="Time (s)", ylabel="Amplitude")
-
-def run_glm(raw_haemo, design_matrix):
-    print(f'Running GLM')
-    data_subset = raw_haemo.copy().pick(picks=range(2))
-    glm_est = run_glm(data_subset, design_matrix)
-    glm_est.to_dataframe().head(9)
-
-def get_hrf(subject_ids):
-    for subject_id in subject_ids:
-        _, raw_haemo = read_subjects_data(
-                subjects=[f'VP{subject_id:03d}'],
-                raw_data_directory=RAW_DIRECTORY,
-                tasks=tasks,
-                eeg_event_translations=EEG_EVENT_TRANSLATIONS,
-                nirs_event_translations=NIRS_EVENT_TRANSLATIONS,
-                eeg_coords=EEG_COORDS,
-                tasks_stimulous_to_crop=TASK_STIMULOUS_TO_CROP,
-                trial_to_check_nirs=TRIAL_TO_CHECK_NIRS,
-                eeg_t_min=eeg_t_min,
-                eeg_t_max=eeg_t_max,
-                nirs_t_min=nirs_t_min,
-                nirs_t_max=nirs_t_max,
-                eeg_sample_rate=eeg_sample_rate,
-                redo_preprocessing=True,
-            )
-        
-        print(f'Shape samples: {raw_haemo.get_data().shape}')
-        events, single_events_dict = mne.events_from_annotations(raw_haemo)
-        print(f'Event Times full: {events[-5:]}')
-        aasdasds=asdasd
-        path_to_design_matrix = os.path.join(OUTPUT_DIRECTORY, f'design_matrix_{subject_id}.csv')
-        if not os.path.exists(path_to_design_matrix):
-            design_matrix = model_hrf_design_matrix(raw_haemo)
-            design_matrix.to_csv(path_to_design_matrix)
-        else:
-            print(f'Design Matrix exists, skipping {subject_id}')
-            design_matrix = pd.read_csv(path_to_design_matrix)
-
-        convolve_hrf(raw_haemo, design_matrix)
-        run_glm(raw_haemo, design_matrix)
+    mrk_data, single_events_dict = mne.events_from_annotations(eeg_raw_mne)
+    mrk_data[:,0] -= mrk_data[0,0]
+    mrk_data[:,0] += (1*data_config['eeg_sample_rate'])
+    print(single_events_dict)
     
+    eeg_data = eeg_raw_mne.get_data()
+    nirs_data = nirs_raw_mne.get_data()
+    print(f'EEG Shape: {eeg_data.shape}') # n_channels x n_samples_eeg
+    print(f'NIRS Shape: {nirs_data.shape}') # n_channels x n_samples_nirs
+    print(f'MRK Shape: {mrk_data.shape}') # n_events x 3 (timestamp, event_type, event_id)
 
-def plot_grand_average_matrix(events, channels, grand_average_dict, sampling_rate):
-    # plot average erp comparison between mne and manual
-    fig, axs = plt.subplots(len(events), len(channels), figsize=(10, 10))
-    times = None
-    for event_name in events:
-        for channel in channels:
-            i = events.index(event_name)
-            j = channels.index(channel)
-            # non-target
-            non_erp =  grand_average_dict[f'{event_name} non-target'].copy().pick(channel)
-            times = non_erp.times*sampling_rate
-            non_erp = non_erp.data.T
-            # target
-            target_erp = grand_average_dict[f'{event_name} target'].copy().pick(channel).data.T
-            # non-target - target
-            difference_erp = non_erp - target_erp
+    # get channels
+    eeg_data = eeg_data[data_config['eeg_channel_index']]
+    nirs_data = nirs_data[data_config['nirs_channel_index']]
 
-            # plot
-            axs[i,j].plot(times, non_erp, label='Non-Target')
-            axs[i,j].plot(times, target_erp, label='Target')
-            axs[i,j].plot(times, difference_erp, label='N-T')
+    # split train and test on eeg_data, nirs_data, and mrk_data
+    eeg_test_size = int(eeg_data.shape[1]*training_config['test_size'])
+    eeg_validation_size = int(eeg_data.shape[1]*training_config['validation_size'])
+    eeg_train_size = eeg_data.shape[1] - eeg_test_size - eeg_validation_size
 
-            if i == 0:
-                axs[i,j].set_title(f'{channel}')
-            if j == 0:
-                axs[i,j].set_ylabel(f'{event_name}')
+    nirs_test_size = int(nirs_data.shape[1]*training_config['test_size'])
+    nirs_validation_size = int(nirs_data.shape[1]*training_config['validation_size'])
+    nirs_train_size = nirs_data.shape[1] - nirs_test_size - nirs_validation_size
 
-            # if test_events.index(event_name) == 0 and test_channels.index(channel) == 0:
-            axs[i,j].legend()
+    train_eeg_data = eeg_data[:, :eeg_train_size]
+    validation_eeg_data = eeg_data[:, eeg_train_size:eeg_train_size+eeg_validation_size]
+    train_nirs_data = nirs_data[:, :nirs_train_size]
+    validation_nirs_data = nirs_data[:, nirs_train_size:nirs_train_size+nirs_validation_size]
 
-def plot_grand_average():
-    # testing grand average
-    grand_average_dict = {
-                        'eeg': {'2-back non-target':[],
-                                '2-back target':[],
-                                '3-back non-target':[],
-                                '3-back target':[]},
-                        'nirs': {'2-back non-target':[],
-                                '2-back target':[],
-                                '3-back non-target':[],
-                                '3-back target':[]}
-                        }
-    subject_ids = np.arange(1,27) # 1-27
-    for subject in subject_ids:
-        eeg_raw_mne, nirs_raw_mne = read_subjects_data(
-            subjects=[f'VP{subject:03d}'],
-            raw_data_directory=RAW_DIRECTORY,
-            tasks=tasks,
-            eeg_event_translations=EEG_EVENT_TRANSLATIONS,
-            nirs_event_translations=NIRS_EVENT_TRANSLATIONS,
-            eeg_coords=EEG_COORDS,
-            tasks_stimulous_to_crop=TASK_STIMULOUS_TO_CROP,
-            trial_to_check_nirs=TRIAL_TO_CHECK_NIRS,
-            eeg_t_min=eeg_t_min,
-            eeg_t_max=eeg_t_max,
-            nirs_t_min=nirs_t_min,
-            nirs_t_max=nirs_t_max,
-            eeg_sample_rate=eeg_sample_rate,
-            redo_preprocessing=False,
-        )
+    test_eeg_data = eeg_data[:, eeg_train_size+eeg_validation_size:]
+    test_nirs_data = nirs_data[:, nirs_train_size+nirs_validation_size:]
 
-        for signal_name, task_dict in grand_average_dict.items():
-            if signal_name == 'eeg':
-                epochs = process_eeg_epochs(
-                    eeg_raw_mne, 
-                    eeg_t_min,
-                    eeg_t_max)
-            elif signal_name == 'nirs':
-                epochs = process_nirs_epochs(
-                    nirs_raw_mne, 
-                    eeg_t_min,
-                    eeg_t_max)
+    # # normalize data
+    train_eeg_data = (train_eeg_data - np.mean(train_eeg_data)) / np.std(train_eeg_data)
+    validation_eeg_data = (validation_eeg_data - np.mean(validation_eeg_data)) / np.std(validation_eeg_data)
+    test_eeg_data = (test_eeg_data - np.mean(test_eeg_data)) / np.std(test_eeg_data)
+    train_nirs_data = (train_nirs_data - np.mean(train_nirs_data)) / np.std(train_nirs_data)
+    validation_nirs_data = (validation_nirs_data - np.mean(validation_nirs_data)) / np.std(validation_nirs_data)
+    test_nirs_data = (test_nirs_data - np.mean(test_nirs_data)) / np.std(test_nirs_data)
 
-            for task_name in task_dict:
-                grand_average_dict[signal_name][task_name].append(epochs[task_name].average())
-        
-    # get grand average
-    grand_averages = {'eeg':{}, 'nirs':{}}
-    for signal_name, task_dict in grand_average_dict.items():
-        for task_name in task_dict:
-            if len(task_dict[task_name]) != 0:
-                grand_averages[signal_name][task_name] = mne.grand_average(grand_average_dict[signal_name][task_name])
+    print(f'Train EEG Shape: {train_eeg_data.shape}')
+    print(f'Train NIRS Shape: {train_nirs_data.shape}')
+    print(f'Validation EEG Shape: {validation_eeg_data.shape}')
+    print(f'Validation NIRS Shape: {validation_nirs_data.shape}')
+    print(f'Test EEG Shape: {test_eeg_data.shape}')
+    print(f'Test NIRS Shape: {test_nirs_data.shape}')
 
-    test_events = ['2-back',
-                    '3-back']
-    
-    # EEG grand average
-    eeg_test_channels = [
-                'Cz',
-                'Pz',]
-    plot_grand_average_matrix(test_events, eeg_test_channels, grand_averages['eeg'], eeg_sample_rate)
+    # Calculate train and test mrk_data
+    train_max_event_timestamp = train_eeg_data.shape[1]
+    validation_max_event_timestamp = validation_eeg_data.shape[1] + train_max_event_timestamp
+    # MRK (timestamp, event_type, event_id)
+    train_mrk_data = np.array([event for event in mrk_data if event[0] < train_max_event_timestamp])
+    validation_mrk_data = np.array([event for event in mrk_data if event[0] >= train_max_event_timestamp and event[0] < validation_max_event_timestamp])
+    test_mrk_data = np.array([event for event in mrk_data if event[0] >= validation_max_event_timestamp])
+    # subtract train_max_event_timestamp from all index values in test_mrk_data
+    validation_mrk_data[:,0] -= train_max_event_timestamp
+    test_mrk_data[:,0] -= validation_max_event_timestamp
 
-    # NIRS grand average
-    nirs_test_channels = [
-                'AF7',
-                'C3h',]
-    
-    nirs_channels_to_use_ids = translate_channel_name_to_ch_id(nirs_test_channels, NIRS_COORDS, nirs_raw_mne.ch_names)
-    nirs_test_channels = []
-    for channel_id in nirs_channels_to_use_ids:
-        nirs_test_channels.append(f'{channel_id} hbo')
-        nirs_test_channels.append(f'{channel_id} hbr')
-    plot_grand_average_matrix(test_events, nirs_test_channels, grand_averages['nirs'], 10.42)
+    print(train_mrk_data[:5])
+    print(f'Train EEG Shape: {train_eeg_data.shape}')
+    print(f'Train NIRS Shape: {train_nirs_data.shape}')
+    print(f'Train MRK Shape: {train_mrk_data.shape}')
+    print(f'Validation EEG Shape: {validation_eeg_data.shape}')
+    print(f'Validation NIRS Shape: {validation_nirs_data.shape}')
+    print(f'Validation MRK Shape: {validation_mrk_data.shape}')
+    print(f'Test EEG Shape: {test_eeg_data.shape}')
+    print(f'Test NIRS Shape: {test_nirs_data.shape}')
+    print(f'Test MRK Shape: {test_mrk_data.shape}')
 
-    plt.show()
-    input('Press Enter to continue...')
+    # print counts of unique markers in train_mrk_data and test_mrk_data
+    reverse_single_events_dict = {v: k for k, v in single_events_dict.items()}
+    print("Train MRK Counts:")
+    train_unique, train_counts = np.unique(train_mrk_data[:, 2], return_counts=True)
+    for marker, count in zip(train_unique, train_counts):
+        print(f"  Marker {reverse_single_events_dict[marker]}: {count}")
+
+    print("\nValidation MRK Counts:")
+    validation_unique, validation_counts = np.unique(validation_mrk_data[:, 2], return_counts=True)
+    for marker, count in zip(validation_unique, validation_counts):
+        print(f"  Marker {reverse_single_events_dict[marker]}: {count}")
+
+    print("\nTest MRK Counts:")
+    test_unique, test_counts = np.unique(test_mrk_data[:, 2], return_counts=True)
+    for marker, count in zip(test_unique, test_counts):
+        print(f"  Marker {reverse_single_events_dict[marker]}: {count}")
+
+    # channel_names = ['Cz', 'Pz']  # Add more channel names as needed
+    # event_selection = ['2-back non-target', '2-back target']
+    # plot_erp_by_channel(train_eeg_data, train_mrk_data, single_events_dict, channel_names, event_selection)
+
+    # grab coordinates at indexes
+    eeg_coordinates = np.array(list(EEG_COORDS.values()))[data_config['eeg_channel_index']]
+    nirs_coordinates = np.array(list(NIRS_COORDS.values()))[data_config['nirs_channel_index']]
+
+    data_dict = {
+        'train_eeg_data': train_eeg_data,
+        'train_nirs_data': train_nirs_data,
+        'test_eeg_data': test_eeg_data,
+        'test_nirs_data': test_nirs_data,
+        'train_mrk_data': train_mrk_data,
+        'test_mrk_data': test_mrk_data,
+        'validation_eeg_data': validation_eeg_data,
+        'validation_nirs_data': validation_nirs_data,
+        'validation_mrk_data': validation_mrk_data,
+
+        'eeg_coordinates': eeg_coordinates,
+        'nirs_coordinates': nirs_coordinates
+    }
+
+    return data_dict, fnirs_sample_rate, single_events_dict
 
 
-def plot_erp_matrix(subject_ids,
-                    nirs_test_channels=['AF7', 'C3h'],
-                    eeg_test_channels=['Cz', 'Pz'],
-                    test_events=['2-back non-target', '2-back target']):
-    # Initialize ERP average dictionary
-    erp_average_dict = {'eeg': {}, 'nirs': {}}
-    for signal_name in erp_average_dict.keys():
-        for task_name in test_events:
-            erp_average_dict[signal_name][task_name] = []
-
-    for subject in subject_ids:
-        eeg_raw_mne, nirs_raw_mne = read_subjects_data(
-            subjects=[f'VP{subject:03d}'],
-            raw_data_directory=RAW_DIRECTORY,
-            tasks=tasks,
-            eeg_event_translations=EEG_EVENT_TRANSLATIONS,
-            nirs_event_translations=NIRS_EVENT_TRANSLATIONS,
-            eeg_coords=EEG_COORDS,
-            tasks_stimulous_to_crop=TASK_STIMULOUS_TO_CROP,
-            trial_to_check_nirs=TRIAL_TO_CHECK_NIRS,
-            eeg_t_min=eeg_t_min,
-            eeg_t_max=eeg_t_max,
-            nirs_t_min=nirs_t_min,
-            nirs_t_max=nirs_t_max,
-            eeg_sample_rate=eeg_sample_rate,
-            redo_preprocessing=False,
-        )
-        for signal_name, task_dict in erp_average_dict.items():
-            if signal_name == 'eeg':
-                epochs = process_eeg_epochs(
-                    eeg_raw_mne,
-                    eeg_t_min,
-                    eeg_t_max)
-            elif signal_name == 'nirs':
-                epochs = process_nirs_epochs(
-                    nirs_raw_mne,
-                    eeg_t_min,
-                    eeg_t_max)
-            for task_name in task_dict:
-                erp_average_dict[signal_name][task_name].append(epochs[task_name].average())
-
-    def create_plot(signal_type, test_channels):
-        fig, axs = plt.subplots(len(test_channels), len(subject_ids), figsize=(20, 20))
-        for i, channel in enumerate(test_channels):
-            for j, subject in enumerate(subject_ids):
-                for task_name in test_events:
-                    erp_data = erp_average_dict[signal_type][task_name][j].copy().pick(channel).data.T
-                    times = erp_average_dict[signal_type][task_name][j].times
-                    axs[i, j].plot(times, erp_data, label=task_name)
-                if i == 0:
-                    axs[i, j].set_title(f'{subject}')
-                if j == 0:
-                    axs[i, j].set_ylabel(f'{channel}')
-                if i == 0 and j == 0:
-                    axs[i, j].legend()
-        plt.suptitle(f'{signal_type.upper()} ERP Matrix')
-        return fig
-
-    root = tk.Tk()
-    root.title("ERP Matrix")
-
-    notebook = ttk.Notebook(root)
-    notebook.pack(fill='both', expand=True)
-
-    nirs_channels_to_use_ids = translate_channel_name_to_ch_id(nirs_test_channels, NIRS_COORDS, nirs_raw_mne.ch_names)
-    nirs_test_channels = []
-    for channel_id in nirs_channels_to_use_ids:
-        nirs_test_channels.append(f'{channel_id} hbo')
-        nirs_test_channels.append(f'{channel_id} hbr')
-
-    for signal_type, test_channels in [('eeg', eeg_test_channels), ('nirs', nirs_test_channels)]:
-        frame = ttk.Frame(notebook)
-        notebook.add(frame, text=f'{signal_type.upper()} ERP Matrix')
-
-        fig = create_plot(signal_type, test_channels)
-        canvas = FigureCanvasTkAgg(fig, master=frame)
-        canvas.draw()
-
-        # Create a scrollable frame
-        scrollable_frame = ttk.Frame(frame)
-        scrollable_frame.pack(fill='both', expand=True)
-
-        # Add canvas to scrollable frame
-        canvas_widget = canvas.get_tk_widget()
-        canvas_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-        # Add scrollbars
-        x_scrollbar = ttk.Scrollbar(scrollable_frame, orient=tk.HORIZONTAL, command=canvas_widget.xview)
-        y_scrollbar = ttk.Scrollbar(scrollable_frame, orient=tk.VERTICAL, command=canvas_widget.yview)
-        canvas_widget.configure(xscrollcommand=x_scrollbar.set, yscrollcommand=y_scrollbar.set)
-        x_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
-        y_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Add toolbar for zooming and panning
-        toolbar = NavigationToolbar2Tk(canvas, frame)
-        toolbar.update()
-        toolbar.pack(side=tk.BOTTOM, fill=tk.X)
-
-    root.mainloop()
-
-def plot_erp(eeg_epochs, test_events, test_channels):
-    # plot average erp comparison between mne and manual
-    fig, axs = plt.subplots(len(test_events), len(test_channels), figsize=(10, 10))
-    print(np.shape(axs))
-    times = None
-    for event_name in test_events:
-        for channel in test_channels:
-            epoch_eeg_select = eeg_epochs.copy().pick(channel)
-            # non-target
-            non_erp =  epoch_eeg_select[f'{event_name} non-target']
-            times = non_erp.times
-            non_erp = non_erp.average().data.T
-            # target
-            target_erp = epoch_eeg_select[f'{event_name} target'].average().data.T
-            # non-target - target
-            difference_erp = non_erp - target_erp
-            # plot
-            axs[test_events.index(event_name), test_channels.index(channel)].plot(times, non_erp, label='Non-Target')
-            axs[test_events.index(event_name), test_channels.index(channel)].plot(times, target_erp, label='Target')
-            axs[test_events.index(event_name), test_channels.index(channel)].plot(times, difference_erp, label='N-T')
-
-            if test_events.index(event_name) == 0:
-                axs[test_events.index(event_name), test_channels.index(channel)].set_title(f'{channel}')
-            if test_channels.index(channel) == 0:
-                axs[test_events.index(event_name), test_channels.index(channel)].set_ylabel(f'{event_name}')
-
-            # if test_events.index(event_name) == 0 and test_channels.index(channel) == 0:
-            axs[test_events.index(event_name), test_channels.index(channel)].legend()
-
-def plot_erp_comparison(eeg_data, mrk_data, eeg_epochs, test_events, test_channels, single_events_dict):
-    fig, axs = plt.subplots(len(test_events), len(test_channels), figsize=(20, 15))
-    
-    # Calculate ERP from extracted data
-    for event_idx, event_name in enumerate(test_events):
-        event_indices = mrk_data[mrk_data[:, 2] == single_events_dict[event_name], 0]
-        
-        for channel_idx, channel in enumerate(test_channels):
-            channel_data = eeg_data[EEG_CHANNEL_NAMES.index(channel)]
-            
-            # Extract epochs
-            epochs = []
-            for event_time in event_indices:
-                start = int(event_time + eeg_t_min * eeg_sample_rate)
-                end = int(event_time + eeg_t_max * eeg_sample_rate)
-                if start >= 0 and end < channel_data.shape[0]:
-                    epochs.append(channel_data[start:end])
-            
-            # Calculate ERP
-            erp = np.mean(epochs, axis=0)
-            times = np.linspace(eeg_t_min, eeg_t_max, erp.shape[0])
-            
-            # Plot ERP from extracted data
-            axs[event_idx, channel_idx].plot(times, erp, label='Extracted')
-            axs[event_idx, channel_idx].set_title(f'{event_name} - {channel} (Extracted)')
-            
-            # Plot ERP from MNE epoched object
-            evoked = eeg_epochs[event_name].average().pick(channel)
-            axs[event_idx, channel_idx].plot(evoked.times, evoked.data.T, label='MNE')
-            axs[event_idx, channel_idx].set_title(f'{event_name} - {channel} (MNE)')
-            
-            axs[event_idx, channel_idx].set_xlabel('Time (s)')
-            axs[event_idx, channel_idx].set_ylabel('Amplitude')
-            axs[event_idx, channel_idx].legend()
-            axs[event_idx, channel_idx].grid(True)
-    
-    plt.tight_layout()
-    plt.show()
-    
-def run_model(subject_id_int,
-              model_name_base, 
-              nirs_channels_to_use_base, 
-              eeg_channels_to_use, 
-              eeg_channel_index, 
-              nirs_channel_index, 
-              num_epochs, 
-              redo_train=False):
-    model_function = model_functions[model_name_base]
-    loss_amount = loss_amounts[model_name_base]
+def run_model(subject_id_int, model_name, model_config, data_config, training_config, visualization_config):
     subject_id = f'{subject_id_int:02d}'
-    model_name = f'{model_name_base}_{subject_id}'
-    final_model_path = os.path.join(MODEL_WEIGHTS, f'{model_name}_{num_epochs}.pth')
-    if os.path.exists(final_model_path) and not redo_train:
+    final_model_path = os.path.join(MODEL_WEIGHTS, f'{model_name}_{training_config["num_epochs"]}.pth')
+    
+    if visualization_config['do_wandb']:
+        # Initialize wandb
+        wandb.init(project="eeg-fnirs-transcoding",
+               name=model_name,
+               config={**model_config, **data_config, **training_config, **visualization_config})
+    
+    if os.path.exists(final_model_path) and not training_config['redo_train']:
         print(f'Model name exists, skipping {model_name}')
     else:
         print(f'Starting {model_name}')
-        model = model_function(len(nirs_channels_to_use_base)*nirs_token_size, len(eeg_channels_to_use)*eeg_token_size)
-            
-        # Pre-allocate memory for training and testing data
-        # eeg_data, nirs_data, mrk_data = read_matlab_file(subject_id, BASE_PATH)
-        eeg_raw_mne, nirs_raw_mne = read_subjects_data(
-            subjects=[f'VP{subject_id_int:03d}'],
-            raw_data_directory=RAW_DIRECTORY,
-            tasks=tasks,
-            eeg_event_translations=EEG_EVENT_TRANSLATIONS,
-            nirs_event_translations=NIRS_EVENT_TRANSLATIONS,
-            eeg_coords=EEG_COORDS,
-            tasks_stimulous_to_crop=TASK_STIMULOUS_TO_CROP,
-            trial_to_check_nirs=TRIAL_TO_CHECK_NIRS,
-            eeg_t_min=eeg_t_min,
-            eeg_t_max=eeg_t_max,
-            nirs_t_min=nirs_t_min,
-            nirs_t_max=nirs_t_max,
-            eeg_sample_rate=eeg_sample_rate,
-            redo_preprocessing=False,
-        )
 
-        #remove HEOG and VEOG
-        eeg_raw_mne.drop_channels(['HEOG', 'VEOG'])
-        # get only hbo
-        nirs_raw_mne.pick(picks='hbo')
+        # Calculate spatial bias
+        spatial_bias = torch.from_numpy(calculate_channel_distances(EEG_COORDS, NIRS_COORDS)).float()
 
-        mrk_data, single_events_dict = mne.events_from_annotations(eeg_raw_mne)
-        mrk_data[:,0] -= mrk_data[0,0]
-        mrk_data[:,0] += (1*eeg_sample_rate)
-        print(single_events_dict)
+        data_dict, fnirs_sample_rate, single_events_dict = get_data(subject_id_int, data_config, training_config)
+        eeg_coordinates = torch.from_numpy(data_dict['eeg_coordinates']).float()
+        nirs_coordinates = torch.from_numpy(data_dict['nirs_coordinates']).float()
+
+        # Window data
         
-        eeg_data = eeg_raw_mne.get_data()
-        nirs_data = nirs_raw_mne.get_data()
-        print(f'EEG Shape: {eeg_data.shape}') # n_channels x n_samples_eeg
-        print(f'NIRS Shape: {nirs_data.shape}') # n_channels x n_samples_nirs
-        print(f'MRK Shape: {mrk_data.shape}') # n_events x 3 (timestamp, event_type, event_id)
-
-        # split train and test on eeg_data, nirs_data, and mrk_data
-        test_size = int(eeg_data.shape[1]*test_size_in_subject)
-        train_size = eeg_data.shape[1] - test_size
-
-        train_eeg_data = eeg_data[:, :train_size]
-        train_nirs_data = nirs_data[:, :train_size]
-
-        test_eeg_data = eeg_data[:, test_size:]
-        test_nirs_data = nirs_data[:, test_size:]
-
-        # Calculate train and test mrk_data
-        train_max_event_timestamp = train_eeg_data.shape[1]
-        # MRK (timestamp, event_type, event_id)
-        train_mrk_data = np.array([event for event in mrk_data if event[0] < train_max_event_timestamp])
-        test_mrk_data = np.array([event for event in mrk_data if event[0] >= train_max_event_timestamp])
-
-        print(train_mrk_data[:5])
-        print(f'Train EEG Shape: {train_eeg_data.shape}')
-        print(f'Train NIRS Shape: {train_nirs_data.shape}')
-        print(f'Train MRK Shape: {train_mrk_data.shape}')
-        print(f'Test EEG Shape: {test_eeg_data.shape}')
-        print(f'Test NIRS Shape: {test_nirs_data.shape}')
-        print(f'Test MRK Shape: {test_mrk_data.shape}')
-
-        # get CA dict
-        # cca_dict = get_cca_dict(subject_id, train_nirs_data, train_eeg_data, token_size)
-        fpca_dict = get_fpca_dict(subject_id, 
-                                train_nirs_data, 
-                                train_eeg_data, 
-                                nirs_token_size,
-                                eeg_token_size,
-                                model_weights=MODEL_WEIGHTS,
-                                nirs_t_min=nirs_t_min,
-                                nirs_t_max=nirs_t_max,
-                                eeg_t_min=eeg_t_min,
-                                eeg_t_max=eeg_t_max)
-        eeg_fpcas = fpca_dict['eeg']
-        nirs_fpcas = fpca_dict['nirs']
-
-        # plot variance explained
-        plot_explained_variance_over_dict(
-            nirs_fpcas, 
-            path=os.path.join(OUTPUT_DIRECTORY, f'variance_{model_name}_nirs_fpca.jpeg'), 
-            channel_names=nirs_channels_to_use_base)
-        plot_explained_variance_over_dict(
-            eeg_fpcas, 
-            path=os.path.join(OUTPUT_DIRECTORY, f'variance_{model_name}_eeg_fpca.jpeg'), 
-            channel_names=eeg_channels_to_use)
-
         # Train data
         eeg_windowed_train, nirs_windowed_train, meta_data = grab_random_windows(
-                        nirs_data=train_nirs_data, 
-                        eeg_data=train_eeg_data,
-                        sampling_rate=200,
-                        nirs_t_min=nirs_t_min, 
-                        nirs_t_max=nirs_t_max,
-                        eeg_t_min=0, 
-                        eeg_t_max=1,
-                        number_of_windows=10000)
-        
-        eeg_windowed_train = eeg_windowed_train[:, :, :eeg_lookback]
-        nirs_windowed_train = nirs_windowed_train[:, :, :fnirs_lookback]
+            nirs_data=data_dict['train_nirs_data'], 
+            eeg_data=data_dict['train_eeg_data'],
+            nirs_sampling_rate=fnirs_sample_rate,
+            eeg_sampling_rate=data_config['eeg_sample_rate'],
+            nirs_t_min=data_config['nirs_t_min'],
+            nirs_t_max=data_config['nirs_t_max'],
+            eeg_t_min=data_config['eeg_t_min'], 
+            eeg_t_max=data_config['eeg_t_max'],
+            number_of_windows=100)
 
-        # nirs_windowed_train = perform_cca_over_channels(nirs_windowed_train, cca_dict, token_size)
-        # eeg_windowed_train = perform_cca_over_channels(eeg_windowed_train, cca_dict, token_size)
-        nirs_windowed_train = perform_fpca_over_channels(nirs_windowed_train, 
-                                                        nirs_fpcas, 
-                                                        nirs_token_size)
-        eeg_windowed_train = perform_fpca_over_channels(eeg_windowed_train, 
-                                                        eeg_fpcas, 
-                                                        eeg_token_size)
+        # Train data in order for visualization
+        eeg_windowed_train_ordered, nirs_windowed_train_ordered, meta_data, train_mrk_data_ordered = grab_ordered_windows(
+            nirs_data=data_dict['train_nirs_data'], 
+            eeg_data=data_dict['train_eeg_data'],
+            nirs_sampling_rate=fnirs_sample_rate,
+            eeg_sampling_rate=data_config['eeg_sample_rate'],
+            nirs_t_min=data_config['nirs_t_min'],
+            nirs_t_max=data_config['nirs_t_max'],
+            eeg_t_min=data_config['eeg_t_min'], 
+            eeg_t_max=data_config['eeg_t_max'],
+            markers=data_dict['train_mrk_data'])
+        
+        # validation data in order
+        eeg_windowed_validation, nirs_windowed_validation, meta_data, validation_mrk_data_ordered = grab_ordered_windows(
+            nirs_data=data_dict['validation_nirs_data'], 
+            eeg_data=data_dict['validation_eeg_data'],
+            nirs_sampling_rate=fnirs_sample_rate,
+            eeg_sampling_rate=data_config['eeg_sample_rate'],
+            nirs_t_min=data_config['nirs_t_min'],
+            nirs_t_max=data_config['nirs_t_max'],
+            eeg_t_min=data_config['eeg_t_min'], 
+            eeg_t_max=data_config['eeg_t_max'],
+            markers=data_dict['validation_mrk_data'])
+
+        # Test data
+        eeg_windowed_test, nirs_windowed_test, meta_data, test_mrk_data_ordered = grab_ordered_windows(
+            nirs_data=data_dict['test_nirs_data'], 
+            eeg_data=data_dict['test_eeg_data'],
+            nirs_sampling_rate=fnirs_sample_rate,
+            eeg_sampling_rate=data_config['eeg_sample_rate'],
+            nirs_t_min=data_config['nirs_t_min'],
+            nirs_t_max=data_config['nirs_t_max'],
+            eeg_t_min=data_config['eeg_t_min'], 
+            eeg_t_max=data_config['eeg_t_max'],
+            markers=data_dict['test_mrk_data'])
+
+        # Tokenization
+        if data_config['tokenization'] == 'fpca':
+            multi_channel_fpca = MultiChannelFPCA(subject_id=subject_id, 
+                                    train_nirs_data=data_dict['train_nirs_data'], 
+                                    train_eeg_data=data_dict['train_eeg_data'], 
+                                    nirs_token_size=data_config['nirs_token_size'],
+                                    eeg_token_size=data_config['eeg_token_size'],
+                                    fnirs_sample_rate=fnirs_sample_rate,
+                                    eeg_sample_rate=data_config['eeg_sample_rate'],
+                                    nirs_channel_names=data_config['nirs_channels_to_use_base'],
+                                    eeg_channel_names=data_config['eeg_channels_to_use'],
+                                    model_weights=MODEL_WEIGHTS,
+                                    nirs_t_min=data_config['nirs_t_min'],
+                                    nirs_t_max=data_config['nirs_t_max'],
+                                    eeg_t_min=data_config['eeg_t_min'],
+                                    eeg_t_max=data_config['eeg_t_max'])
+
+            # plot variance explained
+            multi_channel_fpca.plot_explained_variance_over_dict(
+                dict_name='nirs',
+                path=os.path.join(visualization_config['output_path'], f'variance_nirs_fpca.jpeg'))
+            multi_channel_fpca.plot_explained_variance_over_dict(
+                dict_name='eeg',
+                path=os.path.join(visualization_config['output_path'], f'variance_eeg_fpca.jpeg'))
+            
+            # plot pca shape tsne
+            multi_channel_fpca.plot_shape(
+                dict_name='nirs',
+                path=os.path.join(visualization_config['output_path'], f'fpca_shape_tsne_nirs_fpca.jpeg'))
+            multi_channel_fpca.plot_shape(
+                dict_name='eeg',
+                path=os.path.join(visualization_config['output_path'], f'fpca_shape_tsne_eeg_fpca.jpeg'))
+            
+            # Apply FPCA
+
+            # Training
+            nirs_windowed_train = multi_channel_fpca.perform_fpca_over_channels(dict_name='nirs',
+                                                                                data=nirs_windowed_train,
+                                                                                n_components=data_config['nirs_token_size'])
+            eeg_windowed_train = multi_channel_fpca.perform_fpca_over_channels(dict_name='eeg',
+                                                                                data=eeg_windowed_train, 
+                                                                                n_components=data_config['eeg_token_size'])
+            # Testing
+            nirs_windowed_train_ordered = multi_channel_fpca.perform_fpca_over_channels(dict_name='nirs',
+                                                                                        data=nirs_windowed_train_ordered,
+                                                                                        n_components=data_config['nirs_token_size'])
+            nirs_windowed_validation = multi_channel_fpca.perform_fpca_over_channels(dict_name='nirs',
+                                                                                     data=nirs_windowed_validation,
+                                                                                     n_components=data_config['nirs_token_size'])
+            nirs_windowed_test = multi_channel_fpca.perform_fpca_over_channels(dict_name='nirs',
+                                                                               data=nirs_windowed_test,
+                                                                               n_components=data_config['nirs_token_size'])
+            tokenizer = multi_channel_fpca
+        elif data_config['tokenization'] == 'raw':
+            # Use raw data without tokenization
+            pass
+        else:
+            raise ValueError(f"Unknown tokenization method: {data_config['tokenization']}")
 
         n_channels = nirs_windowed_train.shape[1]
-        # # plot channels
-        # fig, axs = plt.subplots(n_channels, 1, figsize=(10, 10))
-        # for i in range(n_channels):
-        #     axs[i].plot(nirs_windowed_train[0, i, :])
-        # plt.show()
 
         # Append to the preallocated arrays
         eeg_windowed_train = eeg_windowed_train.transpose(0,2,1)
         nirs_windowed_train = nirs_windowed_train.transpose(0,2,1)
-    
-        eeg_windowed_train = eeg_windowed_train[:,:, eeg_channel_index]
-        nirs_windowed_train = nirs_windowed_train[:,:, nirs_channel_index]
-
-        print(f'EEG Train Shape: {eeg_windowed_train.shape}')
-        print(f'NIRS Train Shape: {nirs_windowed_train.shape}')
-
-        # Train data in order for visualization
-        eeg_windowed_train_ordered, nirs_windowed_train_ordered, meta_data = grab_ordered_windows(
-            nirs_data=train_nirs_data, 
-            eeg_data=train_eeg_data,
-            sampling_rate=200,
-            nirs_t_min=nirs_t_min, 
-            nirs_t_max=nirs_t_max,
-            eeg_t_min=0, 
-            eeg_t_max=1)
-    
-        eeg_windowed_train = eeg_windowed_train[:, :, :eeg_lookback]
-        nirs_windowed_train = nirs_windowed_train[:, :, :fnirs_lookback]
-                
-        # nirs_windowed_test = perform_cca_over_channels(nirs_windowed_test, cca_dict, token_size)
-        nirs_windowed_train_ordered = perform_fpca_over_channels(nirs_windowed_train_ordered, nirs_fpcas, nirs_token_size)
         
         eeg_windowed_train_ordered = eeg_windowed_train_ordered.transpose(0,2,1)
         nirs_windowed_train_ordered = nirs_windowed_train_ordered.transpose(0,2,1)
-    
-        eeg_windowed_train_ordered = eeg_windowed_train_ordered[:,:, eeg_channel_index]
-        nirs_windowed_train_ordered = nirs_windowed_train_ordered[:,:, nirs_channel_index]
 
+        eeg_windowed_validation = eeg_windowed_validation.transpose(0,2,1)
+        nirs_windowed_validation = nirs_windowed_validation.transpose(0,2,1)
+
+        eeg_windowed_test = eeg_windowed_test.transpose(0,2,1)
+        nirs_windowed_test = nirs_windowed_test.transpose(0,2,1)
+
+        print(f'Tokenized EEG Train Shape: {eeg_windowed_train.shape}')
+        print(f'Tokenized NIRS Train Shape: {nirs_windowed_train.shape}')
         print(f'EEG Train Ordered Shape: {eeg_windowed_train_ordered.shape}')
         print(f'NIRS Train Ordered Shape: {nirs_windowed_train_ordered.shape}')
 
-        # Test data
-        eeg_windowed_test, nirs_windowed_test, meta_data = grab_ordered_windows(
-                    nirs_data=test_nirs_data, 
-                    eeg_data=test_eeg_data,
-                    sampling_rate=200,
-                    nirs_t_min=nirs_t_min,
-                    nirs_t_max=nirs_t_max,
-                    eeg_t_min=0, 
-                    eeg_t_max=1)
-        
-        eeg_windowed_train = eeg_windowed_train[:, :, :eeg_lookback]
-        nirs_windowed_train = nirs_windowed_train[:, :, :fnirs_lookback]
-
-        # nirs_windowed_test = perform_cca_over_channels(nirs_windowed_test, cca_dict, token_size)
-        nirs_windowed_test = perform_fpca_over_channels(nirs_windowed_test, 
-                                                        nirs_fpcas, 
-                                                        nirs_token_size)
-        
-        eeg_windowed_test = eeg_windowed_test.transpose(0,2,1)
-        nirs_windowed_test = nirs_windowed_test.transpose(0,2,1)
-    
-        eeg_windowed_test = eeg_windowed_test[:,:, eeg_channel_index]
-        nirs_windowed_test = nirs_windowed_test[:,:, nirs_channel_index]
-
         print(f'EEG Test Shape: {eeg_windowed_test.shape}')
         print(f'NIRS Test Shape: {nirs_windowed_test.shape}')
+        print(f'Tokenized EEG Test Shape: {eeg_windowed_test.shape}')
+        print(f'Tokenized NIRS Test Shape: {nirs_windowed_test.shape}')
 
-        # Perform inference on test
-        nirs_test_tensor = nirs_windowed_test.reshape(-1, len(nirs_channel_index)*nirs_token_size)
+        # Flatten the data
+        # nirs_windowed_validation = nirs_windowed_validation.reshape(-1, len(data_config['nirs_channel_index'])*data_config['nirs_token_size'])
+        # nirs_windowed_test = nirs_windowed_test.reshape(-1, len(data_config['nirs_channel_index'])*data_config['nirs_token_size'])
+        # nirs_windowed_train_ordered = nirs_windowed_train_ordered.reshape(-1, len(data_config['nirs_channel_index'])*data_config['nirs_token_size'])
 
-        nirs_test_tensor = torch.from_numpy(nirs_test_tensor).float()
-        eeg_test_tensor = torch.from_numpy(eeg_windowed_test).float()
+        data_dict = {
+            'eeg_windowed_train': eeg_windowed_train,
+            'nirs_windowed_train': nirs_windowed_train,
+            'eeg_windowed_train_ordered': eeg_windowed_train_ordered,
+            'nirs_windowed_train_ordered': nirs_windowed_train_ordered,
+            'eeg_windowed_validation': eeg_windowed_validation,
+            'nirs_windowed_validation': nirs_windowed_validation,
+            'eeg_windowed_test': eeg_windowed_test,
+            'nirs_windowed_test': nirs_windowed_test,
+            'validation_mrk_data_ordered': validation_mrk_data_ordered,
+            'test_mrk_data_ordered': test_mrk_data_ordered,
+            'train_mrk_data_ordered': train_mrk_data_ordered,
 
-        test_dataset = EEGfNIRSData(nirs_test_tensor, eeg_test_tensor)
-        test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+            'spatial_bias': spatial_bias,
+            'tokenizer': tokenizer,
+            'eeg_coordinates': eeg_coordinates,
+            'nirs_coordinates': nirs_coordinates
+        }
 
-        if do_train:
-            # flatten channels and tokens
-            nirs_train_tensor = nirs_windowed_train.reshape(-1, len(nirs_channel_index)*nirs_token_size)
-            eeg_train_tensor = eeg_windowed_train.reshape(-1, len(eeg_channel_index)*eeg_token_size)
+        # Model creation and training
+        model_params = {k: v for k, v in model_config.items() if k != 'name'}
+        model = model_functions[model_config['name']](
+            n_input=len(data_config['nirs_channel_index']) * data_config['nirs_token_size'],
+            n_output=len(data_config['eeg_channel_index']) * data_config['eeg_token_size'],
+            nirs_sequence_length=data_config['nirs_token_size'],
+            eeg_sequence_length=data_config['eeg_token_size'],
+            num_nirs_channels=len(data_config['nirs_channel_index']),
+            num_eeg_channels=len(data_config['eeg_channel_index']),
+            **model_params
+        )
+
+        if training_config['do_train']:
+        
+            train_model(model, 
+                        data_dict=data_dict,
+                        model_name=model_name,
+                        eeg_token_size=data_config['eeg_token_size'],
+                        eeg_channels_to_use=data_config['eeg_channels_to_use'],
+                        visualization_config=visualization_config,
+                        config=training_config)
+
+        # Evaluation and plotting
+        evaluate_and_plot(model, 
+                      tokenizer=tokenizer,
+                      data_dict=data_dict,
+                      single_events_dict=single_events_dict, 
+                      model_name=model_name,
+                      data_config=data_config,
+                      visualization_config=visualization_config)
+        
+        if visualization_config['do_wandb']:
+            wandb.finish()
+
+def train_model(model, 
+                data_dict,
+                model_name,
+                eeg_token_size,
+                eeg_channels_to_use,
+                visualization_config,
+                config):
+    model.to(DEVICE)
+
+    nirs_train_tensor = data_dict['nirs_windowed_train']
+    eeg_train_tensor = data_dict['eeg_windowed_train']
+    
+    nirs_train_tensor = torch.from_numpy(nirs_train_tensor).float()
+    eeg_train_tensor = torch.from_numpy(eeg_train_tensor).float()
+    # meta_data_tensor = torch.from_numpy(np.array(meta_data)).float()
+    
+    dataset = EEGfNIRSData(nirs_train_tensor, eeg_train_tensor)
+    train_loader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+    # Perform inference on validation
+    nirs_validation_tensor = torch.from_numpy(data_dict['nirs_windowed_validation']).float()
+    eeg_validation_tensor = torch.from_numpy(data_dict['eeg_windowed_validation']).float()
+
+    validation_dataset = EEGfNIRSData(nirs_validation_tensor, eeg_validation_tensor)
+    validation_loader = DataLoader(validation_dataset, batch_size=1, shuffle=False)
+
+    validation_dataset = EEGfNIRSData(nirs_validation_tensor, eeg_validation_tensor)
+    validation_loader = DataLoader(validation_dataset, batch_size=32, shuffle=True)
+    
+    latest_epoch = 0
+    loss_list = []
+    if config['do_load']:
+        model_path = f'{model_name}_epoch_1.pth'
+
+        # find the latest model
+        for file in os.listdir(MODEL_WEIGHTS):
+            if file.startswith(f'{model_name}_epoch_'):
+                epoch = int(file.split('_')[-1].split('.')[0])
+                if epoch > latest_epoch:
+                    latest_epoch = epoch
+                    model_path = file
+        print(f'Using Model Weights: {model_path}')
+        model.load_state_dict(torch.load(os.path.join(MODEL_WEIGHTS, model_path)))
+    
+        # load loss list
+        with open(os.path.join(MODEL_WEIGHTS, f'loss_{model_name}_{latest_epoch}.csv'), 'r') as file_ptr:
+            reader = csv.reader(file_ptr)
+            loss_list = list(reader)[0]
+        print(f'Last loss: {float(loss_list[-1])/len(train_loader):.4f}')
+
+    # Optimizer and loss function
+    optimizer = Adam(model.parameters(), lr=config['learning_rate'])
+    class AmplitudeMSELoss(nn.Module):
+        def __init__(self, amplitude_weight=0.5):
+            super().__init__()
+            self.amplitude_weight = amplitude_weight
+            self.mse = nn.MSELoss()
+
+        def forward(self, predictions, targets):
+            mse_loss = self.mse(predictions, targets)
             
-            nirs_train_tensor = torch.from_numpy(nirs_train_tensor).float()
-            eeg_train_tensor = torch.from_numpy(eeg_train_tensor).float()
-            meta_data_tensor = torch.from_numpy(np.array(meta_data)).float()
+            # Calculate amplitude difference
+            pred_amplitude = torch.max(predictions, dim=1)[0] - torch.min(predictions, dim=1)[0]
+            target_amplitude = torch.max(targets, dim=1)[0] - torch.min(targets, dim=1)[0]
+            amplitude_loss = self.mse(pred_amplitude, target_amplitude)
             
-            print(nirs_train_tensor.shape)
-            print(eeg_train_tensor.shape)
+            return mse_loss + self.amplitude_weight * amplitude_loss
+
+    loss_function = AmplitudeMSELoss(amplitude_weight=0.5)
+    loss_function = torch.nn.MSELoss()
+
+    train_validation_loss_dict = {'train':[], 'validation':[]}
+    for epoch in range(latest_epoch, config['num_epochs']):
+        model.train()
+        total_loss = 0
+
+        for batch_idx, (X_batch, y_batch) in enumerate(train_loader):
+            X_batch = X_batch.to(DEVICE).float()
+            y_batch = y_batch.to(DEVICE).float()
+            # spatial_bias_batch = data_dict['spatial_bias'].to(DEVICE)
+            eeg_coordinates = data_dict['eeg_coordinates'].to(DEVICE).float()
+            nirs_coordinates = data_dict['nirs_coordinates'].to(DEVICE).float()
+
             
-            dataset = EEGfNIRSData(nirs_train_tensor, eeg_train_tensor)
-            dataloader = DataLoader(dataset, batch_size=500, shuffle=True)
-        
-            latest_epoch = 0
-            loss_list = []
-            if do_load:
-                model_path = f'{model_name}_epoch_1.pth'
-        
-                # find the latest model
-                for file in os.listdir(MODEL_WEIGHTS):
-                    if file.startswith(f'{model_name}_epoch_'):
-                        epoch = int(file.split('_')[-1].split('.')[0])
-                        if epoch > latest_epoch:
-                            latest_epoch = epoch
-                            model_path = file
-                print(f'Using Model Weights: {model_path}')
-                model.load_state_dict(torch.load(os.path.join(MODEL_WEIGHTS, model_path)))
-            
-                # load loss list
-                with open(os.path.join(MODEL_WEIGHTS, f'loss_{model_name}_{latest_epoch}.csv'), 'r') as file_ptr:
-                    reader = csv.reader(file_ptr)
-                    loss_list = list(reader)[0]
-                print(f'Last loss: {float(loss_list[-1])/len(dataloader):.4f}')
-        
-            model.to(DEVICE)
-        
-            # Optimizer and loss function
-            optimizer = Adam(model.parameters(), lr=loss_amount)
-            loss_function = torch.nn.MSELoss()
-            train_test_loss_dicct = {'train':[], 'test':[]}
-            for epoch in range(latest_epoch, num_epochs):
-                model.train()
-                total_loss = 0
-        
-                for batch_idx, (X_batch, y_batch) in enumerate(dataloader):
-                    X_batch = X_batch.to(DEVICE).float()
-                    y_batch = y_batch.to(DEVICE).float()
-                    
-                    # Forward pass
-                    predictions = model(X_batch)
-        
-                    # Loss calculation
-                    loss = loss_function(predictions, y_batch)
-        
-                    # Backpropagation
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-        
-                    total_loss += loss.item()
-                    # if (batch_idx+1) % 20 == 0 or batch_idx == 0:
-                    #     print(f'Epoch: {epoch+1}, Batch: {batch_idx+1}, Loss: {loss.item():.4f}')
-                
-                loss_list.append(total_loss)
-        
-                if (epoch+1) % 50 == 0:
-                    # Save model weights
-                    torch.save(model.state_dict(), os.path.join(MODEL_WEIGHTS, f'{model_name}_{epoch+1}.pth'))
-                    with open(os.path.join(MODEL_WEIGHTS,f'loss_{model_name}_{epoch+1}.csv'), 'w', newline='') as file_ptr:
-                        wr = csv.writer(file_ptr, quoting=csv.QUOTE_ALL)
-                        wr.writerow(loss_list)
-                    
-                    targets, predictions = predict_eeg(model, 
-                                                    test_loader, 
-                                                    n_samples=eeg_windowed_test.shape[0], 
-                                                    n_channels=eeg_windowed_test.shape[2], 
-                                                    n_lookback=eeg_windowed_test.shape[1],
-                                                    eeg_token_size=eeg_token_size,
-                                                    eeg_fpcas=eeg_fpcas)
-                    highest_r2 = 0
-                    for channel_id in range(len(eeg_channels_to_use)):
-                        targets_single = targets[:,:,channel_id]
-                        predictions_single = predictions[:,:,channel_id]
+            # Forward pass
+            predictions = model(X_batch, nirs_coordinates, eeg_coordinates)
+            # predictions = model(X_batch)
+            predictions = predictions.reshape(y_batch.shape)
 
-                        target_average = np.mean(targets_single, axis=0)
-                        prediction_average = np.mean(predictions_single, axis=0)
-                        r2 = r2_score(target_average, prediction_average)
-                        if r2 > highest_r2:
-                            highest_r2 = r2
-                
-                    train_test_loss_dicct['train'].append(total_loss / len(dataloader))
-                    train_test_loss_dicct['test'].append(highest_r2)
-                    print(f'Epoch: {epoch+1}, Train Loss: {total_loss / len(dataloader):.4f}, Test Loss: {highest_r2:.4f}')
-                elif (epoch+1) % 10 == 0:
-                    print(f'Epoch: {epoch+1}, Average Loss: {total_loss / len(dataloader):.4f}')
+            # Loss calculation
+            loss = loss_function(predictions, y_batch)
 
-            # Plotting train vs test loss
-            fig, axs = plt.subplots(2, 1, figsize=(18, 6))
-            axs[0].plot(train_test_loss_dicct['train'], label='Train Loss')
-            axs[1].plot(train_test_loss_dicct['test'], label='Test R2')
+            # Backpropagation
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-            axs[0].set_xticklabels(np.arange(0, num_epochs+1, 50))
-            axs[1].set_xticklabels(np.arange(0, num_epochs+1, 50))
-            
-            axs[1].set_xlabel('Epoch')
-            axs[0].set_ylabel('Loss')
-            axs[0].set_title(f'Loss for {model_name}')
-            axs[0].legend()
-            axs[1].legend()
-            axs[0].grid(True)
-            axs[1].grid(True)
-            fig.savefig(os.path.join(OUTPUT_DIRECTORY, f'loss_{model_name}.jpeg'))
-            plt.close()
-
-        # Perform inference on ordered train
-        nirs_train_tensor = nirs_windowed_train_ordered.reshape(-1, len(nirs_channel_index)*nirs_token_size)
-        nirs_train_tensor = torch.from_numpy(nirs_train_tensor).float()
-        eeg_train_tensor = torch.from_numpy(eeg_windowed_train_ordered).float()
-
-        # Assuming fnirs_test and eeg_test are your test datasets
-        train_dataset = EEGfNIRSData(nirs_train_tensor, eeg_train_tensor)
-        train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
+            total_loss += loss.item()
         
-        # Get weights for specific epoch
-        weight_epochs = [100, 250, 500, 1000]
-        for weight_epoch in weight_epochs:
-            model_path = f'{model_name}_{weight_epoch}.pth'
-            model.load_state_dict(torch.load(os.path.join(MODEL_WEIGHTS, model_path)))
-            model.to(DEVICE)
-            model.eval()
+        loss_list.append(total_loss)
 
-            target_train, predictions_train = predict_eeg(model, 
-                                            train_loader, 
-                                            n_samples=eeg_windowed_train_ordered.shape[0], 
-                                            n_channels=eeg_windowed_train_ordered.shape[2], 
-                                            n_lookback=eeg_windowed_train_ordered.shape[1],
-                                            eeg_token_size=eeg_token_size,
-                                            eeg_fpcas=eeg_fpcas)
+        if visualization_config['do_wandb']:
+            # Log to wandb
+            wandb.log({"train_loss": total_loss / len(train_loader), "epoch": epoch + 1})
+
+        if (epoch+1) % 50 == 0:
+            # Save model weights
+            torch.save(model.state_dict(), os.path.join(MODEL_WEIGHTS, f'{model_name}_{epoch+1}.pth'))
+            with open(os.path.join(MODEL_WEIGHTS,f'loss_{model_name}_{epoch+1}.csv'), 'w', newline='') as file_ptr:
+                wr = csv.writer(file_ptr, quoting=csv.QUOTE_ALL)
+                wr.writerow(loss_list)
+
             targets, predictions = predict_eeg(model, 
-                                            test_loader, 
-                                            n_samples=eeg_windowed_test.shape[0], 
-                                            n_channels=eeg_windowed_test.shape[2], 
-                                            n_lookback=eeg_windowed_test.shape[1],
-                                            eeg_token_size=eeg_token_size,
-                                            eeg_fpcas=eeg_fpcas)
-            
-            print(f'Weight Epoch: {weight_epoch}')
-            print(f'Predictions Shape: {predictions.shape}')
-            print(f'Targets Shape: {targets.shape}')
+                                                data_loader=validation_loader, 
+                                                spatial_bias=data_dict['spatial_bias'],
+                                                nirs_coordinates=data_dict['nirs_coordinates'],
+                                                eeg_coordinates=data_dict['eeg_coordinates'],
+                                                n_samples=data_dict['eeg_windowed_validation'].shape[0], 
+                                                n_channels=data_dict['eeg_windowed_validation'].shape[2], 
+                                                n_lookback=data_dict['eeg_windowed_validation'].shape[1],
+                                                eeg_token_size=eeg_token_size,
+                                                tokenizer=data_dict['tokenizer'])
+
+            all_r2 = []
+            for channel_id in range(len(eeg_channels_to_use)):
+                targets_single = targets[:,:,channel_id]
+                predictions_single = predictions[:,:,channel_id]
+
+                target_average = np.mean(targets_single, axis=0)
+                prediction_average = np.mean(predictions_single, axis=0)
+
+                r2 = r2_score(target_average, prediction_average)
+                all_r2.append(r2)
         
-            # scipy.io.savemat(os.path.join(OUTPUT_DIRECTORY, f'test_{model_name}_{weight_epoch}.mat'), {'X': targets, 
-            #                                                         'XPred':predictions,
-            #                                                     'bins':10,
-            #                                                     'scale':10,
-            #                                       F              'srate':200})
-            
-            offset = 0  # Assuming no offset
-            timeSigma = 100  # Assuming a given timeSigma
-            num_bins = 50  # Assuming a given number of bins
+            total_r2 = np.max(all_r2)
+            train_validation_loss_dict['train'].append(total_loss / len(train_loader))
+            train_validation_loss_dict['validation'].append(total_r2)
 
-            # Plotting target vs. output on concatenated data subplots for each channel
-            highest_r2 = 0
-            counter = 0
-            fig, axs = plt.subplots(len(eeg_channels_to_use), 2, figsize=(18, 100))
-            for i in range(len(eeg_channels_to_use)):
-                for j in range(2):
-                    if j == 0:
-                        type_label = 'Train'
-                        do_legend = True
-                        do_colorbar = False
-                        targets_single = target_train[:,:,counter]
-                        predictions_single = predictions_train[:,:,counter]
+            if visualization_config['do_wandb']:
+                # Log to wandb
+                wandb.log({
+                    "validation_r2": total_r2,
+                })
 
-                        target_average = np.mean(targets_single, axis=0)
-                        prediction_average = np.mean(predictions_single, axis=0)
-                        r2 = r2_score(target_average, prediction_average)
-                        
-                        channel_label = list(EEG_COORDS.keys())[counter]
-                    else:
-                        type_label = 'Test'
-                        do_legend = False
-                        do_colorbar = True
-                        targets_single = targets[:,:,counter]
-                        predictions_single = predictions[:,:,counter]
+            print(f'Epoch: {epoch+1}, Train Loss: {total_loss / len(train_loader):.10f}, Validation R2: {total_r2:.10f}')
+        elif (epoch+1) % 10 == 0:
+            print(f'Epoch: {epoch+1}, Average Loss: {total_loss / len(train_loader):.10f}')
 
-                        target_average = np.mean(targets_single, axis=0)
-                        prediction_average = np.mean(predictions_single, axis=0)
-                        r2 = r2_score(target_average, prediction_average)
-                        if r2 > highest_r2:
-                            highest_r2 = r2
+    return model
 
-                        channel_label = list(EEG_COORDS.keys())[counter]
-                        counter += 1
+def evaluate_and_plot(model, 
+                      tokenizer,
+                      data_dict,
+                      single_events_dict, 
+                      model_name, 
+                      data_config,
+                      visualization_config):
+    # Perform inference on ordered train
+    nirs_train_tensor = torch.from_numpy(data_dict['nirs_windowed_train_ordered']).float()
+    eeg_train_tensor = torch.from_numpy(data_dict['eeg_windowed_train_ordered']).float()
 
-                    # reshape to 1xn
-                    targets_single = targets_single.reshape(1, -1)
-                    predictions_single = predictions_single.reshape(1, -1)
+    train_dataset = EEGfNIRSData(nirs_train_tensor, eeg_train_tensor)
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
 
-                    chan_labels = [channel_label]  # Assuming label as provided in the command
-                    test_fig = rolling_correlation(targets_single, 
-                                                predictions_single, 
-                                                chan_labels, 
-                                                offset=offset,
-                                                sampling_frequency=eeg_lookback,
-                                                timeSigma=timeSigma, 
-                                                num_bins=num_bins, 
-                                                zoom_start=0, 
-                                                #    zoom_end=500, 
-                                                do_legend=do_legend,
-                                                do_colorbar=do_colorbar,
-                                                ax=axs[i, j], 
-                                                title='')
-                            
-                    axs[i, j].text(0.5, 0.9, f'{eeg_channels_to_use[i]} {type_label} R-squared: {r2:.4f}', horizontalalignment='center', verticalalignment='center', transform=axs[i, j].transAxes)
-            fig.savefig(os.path.join(OUTPUT_DIRECTORY, f'test_{highest_r2:.4f}_{model_name}_{weight_epoch}.jpeg'))
-            plt.close()
+    # Perform inference on ordered test
+    nirs_test_tensor = torch.from_numpy(data_dict['nirs_windowed_test']).float()
+    eeg_test_tensor = torch.from_numpy(data_dict['eeg_windowed_test']).float()
 
-            # Test predicted vs real ERP from test_mrk
-            
-            # Get test indexes from test_events
-            test_events = ['2-back non-target', '2-back target']
-            test_indexes = [event_timestamp for event_timestamp, event_type, event_id in test_mrk_data if single_events_dict[event_type] in test_events]
+    test_dataset = EEGfNIRSData(nirs_test_tensor, eeg_test_tensor)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
-            fig, axs = plt.subplots(len(eeg_channels_to_use), 1, figsize=(18, 100))
-            for i in range(len(eeg_channels_to_use)):
-                real_data = targets[:,:,i]
-                real_erp = real_data[(real_data[:,0] >= -0.5) & (real_data[:,0] <= 1)]
-                real_erp = np.mean(real_erp, axis=0)
+    # Channel IDX to use
+    channels_to_use_dict = {channel_name:data_config['eeg_channels_to_use'].index(channel_name) for channel_name in visualization_config['channel_names']}
+    
+    # Get weights for specific epoch
+    for weight_epoch in visualization_config['weight_epochs']:
+        model_path = f'{model_name}_{weight_epoch}.pth'
+        model.load_state_dict(torch.load(os.path.join(MODEL_WEIGHTS, model_path)))
+        model.to(DEVICE)
 
-                predicted_data = predictions[:,:,i]
-                predicted_erp = predicted_data[(predicted_data[:,0] >= -0.5) & (predicted_data[:,0] <= 1)]
-                predicted_erp = np.mean(predicted_erp, axis=0)
+        model.eval()
 
-                axs[i].plot(real_erp, label='Real')
-                axs[i].plot(predicted_erp, label='Predicted')
-                axs[i].legend()
-                axs[i].set_title(f'{eeg_channels_to_use[i]}')
-            fig.savefig(os.path.join(OUTPUT_DIRECTORY, f'test_{highest_r2:.4f}_{model_name}_{weight_epoch}_erp.jpeg'))
-            plt.close()
+        targets_train, predictions_train = predict_eeg(model, 
+                                            data_loader=train_loader, 
+                                            spatial_bias=data_dict['spatial_bias'], 
+                                            nirs_coordinates=data_dict['nirs_coordinates'],
+                                            eeg_coordinates=data_dict['eeg_coordinates'],
+                                            n_samples=data_dict['eeg_windowed_train_ordered'].shape[0], 
+                                            n_channels=data_dict['eeg_windowed_train_ordered'].shape[2], 
+                                            n_lookback=data_dict['eeg_windowed_train_ordered'].shape[1],
+                                            eeg_token_size=data_config['eeg_token_size'],
+                                            tokenizer=tokenizer)
+        targets_test, predictions_test = predict_eeg(model, 
+                                            data_loader=test_loader, 
+                                            spatial_bias=data_dict['spatial_bias'], 
+                                            nirs_coordinates=data_dict['nirs_coordinates'],
+                                            eeg_coordinates=data_dict['eeg_coordinates'],
+                                            n_samples=data_dict['eeg_windowed_test'].shape[0], 
+                                            n_channels=data_dict['eeg_windowed_test'].shape[2], 
+                                            n_lookback=data_dict['eeg_windowed_test'].shape[1],
+                                            eeg_token_size=data_config['eeg_token_size'],
+                                            tokenizer=tokenizer)
+        
+        channel_names = list(channels_to_use_dict.keys())
+        channel_indexes = list(channels_to_use_dict.values())
+        targets_train = targets_train[:,:,channel_indexes]
+        predictions_train = predictions_train[:,:,channel_indexes]
+        targets_test = targets_test[:,:,channel_indexes]
+        predictions_test = predictions_test[:,:,channel_indexes]
+        
+        print(f'Weight Epoch: {weight_epoch}')
+        print(f'Train Predictions Shape: {predictions_train.shape}')
+        print(f'Train Targets Shape: {targets_train.shape}')
+        print(f'Test Predictions Shape: {predictions_test.shape}')
+        print(f'Test Targets Shape: {targets_test.shape}')
+    
+        # scipy.io.savemat(os.path.join(visualization_config['output_path'], f'test_{model_name}_{weight_epoch}.mat'), {'X': targets, 
+        #                                                         'XPred':predictions,
+        #                                                     'bins':10,
+        #                                                     'scale':10,
+        #                                       F              'srate':200})
+        
+        ''' Plotting target vs. output on concatenated data subplots for each channel '''
 
-            # plot scatter between timepoints in predicted vs real
-            fig, axs = plt.subplots(len(eeg_channels_to_use), 1, figsize=(18, 100))
-            for i in range(len(eeg_channels_to_use)):
-                real_data = targets[:,:,i]
-                predicted_data = predictions[:,:,i]
+        offset = 0  # Assuming no offset
+        timeSigma = 100  # Assuming a given timeSigma
+        num_bins = 50  # Assuming a given number of bins
 
-                axs[i].scatter(real_data, predicted_data)
-                axs[i].set_xlabel('Real')
-                axs[i].set_ylabel('Predicted')
-                axs[i].set_title(f'{eeg_channels_to_use[i]}')
-            fig.savefig(os.path.join(OUTPUT_DIRECTORY, f'test_{highest_r2:.4f}_{model_name}_{weight_epoch}_scatter.jpeg'))
-            plt.close()
+        highest_correlation = 0
+        num_channels = len(channels_to_use_dict)
+        fig, axs = plt.subplots(num_channels, 2, figsize=(18, 5 * num_channels), squeeze=False)
+        print(f'Plotting target vs output for {num_channels} channels')
+
+        # Pre-compute channel labels
+        channel_labels = list(EEG_COORDS.keys())
+
+        # Prepare data outside the loop
+        train_data = (targets_train, predictions_train, 'Train', True, False)
+        test_data = (targets_test, predictions_test, 'Test', False, True)
+
+        for i, (channel_name, idx) in enumerate(channels_to_use_dict.items()):
+            print(f'Channel Name: {channel_name} Remaining: {len(channels_to_use_dict)-i}')
+            for j, (targets, predictions, type_label, do_legend, do_colorbar) in enumerate([train_data, test_data]):
+                targets_single = targets[:,:,i].reshape(1, -1)
+                predictions_single = predictions[:,:,i].reshape(1, -1)
+
+                # r2 = r2_score(targets_single, predictions_single)
+                # if j == 1 and r2 > highest_r2:
+                #     highest_r2 = r2
+
+                _, average_correlation = rolling_correlation(targets_single, 
+                                    predictions_single, 
+                                    [channel_name], 
+                                    offset=offset,
+                                    sampling_frequency=data_config['eeg_sample_rate'],
+                                    timeSigma=timeSigma, 
+                                    num_bins=num_bins, 
+                                    zoom_start=0, 
+                                    do_legend=do_legend,
+                                    do_colorbar=do_colorbar,
+                                    ax=axs[i, j], 
+                                    title='')
+                
+                if j==1 and average_correlation > highest_correlation:
+                    highest_correlation = average_correlation
+                
+                axs[i, j].text(0.5, 0.9, f'{channel_name} {type_label} Cor: {average_correlation:.10f}', 
+                            horizontalalignment='center', verticalalignment='center', 
+                            transform=axs[i, j].transAxes)
+
+        plt.tight_layout()
+        fig.savefig(os.path.join(visualization_config['output_path'], f'summary_correlation_{highest_correlation:.10f}_{model_name}_{weight_epoch}.jpeg'))
+        plt.close()
+
+        ''' Compare train and test predictions and ERPS'''
+        # concatenate windows targets and predictions (sample, window, channel) -> (sample*window, channel)
+        targets_train = targets_train.reshape(-1, len(channels_to_use_dict))
+        predictions_train = predictions_train.reshape(-1, len(channels_to_use_dict))
+
+        targets_test = targets_test.reshape(-1, len(channels_to_use_dict))
+        predictions_test = predictions_test.reshape(-1, len(channels_to_use_dict))
+
+        # plot scatter between timepoints in predicted vs real for both train and test
+        fig, axs = plot_scatter_between_timepoints(
+            targets_train,
+            predictions_train,
+            targets_test,
+            predictions_test,
+            channel_names
+        )
+        
+        fig.savefig(os.path.join(visualization_config['output_path'], f'{highest_correlation:.10f}_{model_name}_{weight_epoch}_scatter_combined.jpeg'))
+        plt.close()
+
+        # Train predicted vs real ERP from train_mrk
+        print('Train ERP')
+        fig, axs = compare_real_vs_predicted_erp(targets_train.T, 
+                                        predictions_train.T, 
+                                        data_dict['train_mrk_data_ordered'], 
+                                        single_events_dict, 
+                                        channel_names, 
+                                        visualization_config['events'])
+        
+        fig.savefig(os.path.join(visualization_config['output_path'], f'train_{highest_correlation:.10f}_{model_name}_{weight_epoch}_erp.jpeg'))
+        plt.close()
+
+        # Test predicted vs real ERP from test_mrk
+        print('Test ERP')
+        fig, axs = compare_real_vs_predicted_erp(targets_test.T, 
+                                        predictions_test.T, 
+                                        data_dict['test_mrk_data_ordered'], 
+                                        single_events_dict, 
+                                        channel_names, 
+                                        visualization_config['events'])
+        
+        fig.savefig(os.path.join(visualization_config['output_path'], f'test_{highest_correlation:.10f}_{model_name}_{weight_epoch}_erp.jpeg'))
+        plt.close()
+
+        if visualization_config['do_wandb']:
+            # Log final metrics to wandb
+            wandb.log({
+                "final_test_correlation": highest_correlation,
+                "weight_epoch": weight_epoch
+            })
 
 def main():
-    
-    # subject_ids = np.arange(1, 27)  # 1-27
-    # subject_ids = [1]
+    set_seed(42)  # You can choose any integer as your seed
 
     # get_hrf(subject_ids)
     # input('Press Enter to continue...')
@@ -891,62 +794,102 @@ def main():
     #                 nirs_test_channels=list(NIRS_COORDS.keys()),
     #                 eeg_test_channels=EEG_CHANNEL_NAMES,
     #                 test_events=['2-back non-target', '2-back target'])
+    
+
+    # Make a new timestamp folder at OUTPUT_DIRECTORY for this run
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    base_output_directory = os.path.join(OUTPUT_DIRECTORY, timestamp)
+    os.makedirs(base_output_directory, exist_ok=True)
 
     # Define channels to use
     nirs_channels_to_use_base = list(NIRS_COORDS.keys())
     nirs_channel_index = find_indices(list(NIRS_COORDS.keys()),nirs_channels_to_use_base)
 
-    eeg_channels_to_use = EEG_CHANNEL_NAMES
+    eeg_channels_to_use = list(EEG_COORDS.keys())
     eeg_channel_index = find_indices(EEG_CHANNEL_NAMES,eeg_channels_to_use)
 
-    for subject_id_int in subject_ids:
-        for model_name_base in ['rnn', 'mlp']:
-            run_model(subject_id_int, 
-                    model_name_base, 
-                    nirs_channels_to_use_base, 
-                    eeg_channels_to_use, 
-                    eeg_channel_index, 
-                    nirs_channel_index, 
-                    num_epochs, 
-                    redo_train=False)
-            gc.collect()
-            torch.cuda.empty_cache()
+    # Configuration
+    data_config = {
+        'tasks': ['nback'],
+        'nirs_channels_to_use_base': nirs_channels_to_use_base,
+        'eeg_channels_to_use': eeg_channels_to_use,
+        'eeg_channel_index': eeg_channel_index,
+        'nirs_channel_index': nirs_channel_index,
+        'eeg_sample_rate': 200,
+        'eeg_t_min': 0,
+        'eeg_t_max': 1,
+        'nirs_t_min': -5,
+        'nirs_t_max': 10,
+        # 'nirs_token_size': 20,
+        # 'eeg_token_size': 10,
+        'tokenization': 'fpca',  # or 'raw'
+    }
+
+    visualization_config = {
+        'do_wandb': False,
+        'do_plot': True,
+        'do_save': True,
+        'weight_epochs': [500, 1000],
+        'channel_names': list(EEG_COORDS.keys()),
+        'events': ['2-back non-target', '2-back target', '3-back non-target', '3-back target'],
+        'output_path': base_output_directory
+    }
+
+    model_configs = [
+        {
+        'name': 'rnn',
+        'hidden_dim': 64,
+        }
+    ]
+
+    training_configs = [
+        {
+        'do_train': True,
+        'do_load': False,
+        'redo_train': True,
+        'num_epochs': 1000,
+        'test_size': 0.15,
+        'validation_size': 0.05,
+        'learning_rate': 0.001,
+        }
+    ]
+
+    token_sizes = [
+        {
+            'nirs_token_size': 20,
+            'eeg_token_size': 10,
+        },
+    ]
+
+    # from config.training_dictionaries import model_configs, training_configs
+
+
+    run_number = 1
+    subject_ids = [1] #range(4, 5)  # 1-27
+    for subject_id in subject_ids:
+        for token_size in token_sizes:
+            for model_config in model_configs:
+                for training_config in training_configs:
+                    model_name = f'{model_config["name"]}_{subject_id:02d}_n_chs_{len(data_config["nirs_channel_index"])}_{len(data_config["eeg_channel_index"])}_{run_number}'
+                    # Timestamp for loop
+                    output_directory = os.path.join(base_output_directory, model_name)
+                    os.makedirs(output_directory, exist_ok=True)
+
+                    print(f"Running model for subject {subject_id} with config:")
+                    print(f"Model config: {model_config}")
+                    print(f"Training config: {training_config}")
+                    print(f"Token size: {token_size}")
+
+                    data_config = data_config | token_size
+                    visualization_config['output_path'] = output_directory
+                    save_config(subject_id, model_config, data_config, training_config, visualization_config)
+                    
+                    run_model(subject_id, model_name, model_config, data_config, training_config, visualization_config)
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                    run_number += 1
 
 if __name__ == '__main__':
-    ## Subject/Trial Parameters ##
-    subject_ids = np.arange(1,27) # 1-27
-    subjects = []
-    for i in subject_ids:
-        subjects.append(f'VP{i:03d}')
-
-    tasks = ['nback']
-    hemoglobin_types = ['hbo', 'hbr']
-
-    # NIRS Sampling rate
-    fnirs_sample_rate = 10.41
-    # EEG Downsampling rate
-    eeg_sample_rate = 200
-    # Time window (seconds)
-    eeg_t_min = -0.5
-    eeg_t_max = 1
-    nirs_t_min = -0.5
-    nirs_t_max = 1
-    offset_t = 0
-
-    # Redo preprocessing pickle files, TAKES A LONG TIME 
-    redo_preprocessing = False
-    do_load = False
-    do_train = True
-
-    # data projection
-    nirs_token_size = 10
-    eeg_token_size = 5
-    fnirs_lookback = 4000
-    eeg_lookback = 200
-
-    # training loop
-    num_epochs = 100
-    test_size_in_subject = 0.2 # percent of test data
-
     main()
 
