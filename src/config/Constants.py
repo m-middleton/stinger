@@ -1,10 +1,11 @@
 from os.path import join
 
-# BASE_PATH = '../data/'
-BASE_PATH = '../../data/'
+BASE_PATH = '../data/'
+# BASE_PATH = '../../data/'
 
-ROOT_DIRECTORY_EEG = join(BASE_PATH, 'raw/eeg/')
-ROOT_DIRECTORY_NIRS = join(BASE_PATH, 'raw/nirs/')
+RAW_DIRECTORY = join(BASE_PATH, 'raw/')
+ROOT_DIRECTORY_EEG = join(RAW_DIRECTORY, 'eeg/')
+ROOT_DIRECTORY_NIRS = join(RAW_DIRECTORY, 'nirs/')
 MODEL_WEIGHTS = join(BASE_PATH, 'model_weights/')
 OUTPUT_DIRECTORY = join(BASE_PATH, 'output/')
 
@@ -194,13 +195,14 @@ EEG_COORDS = {'FP1':(-0.3090,0.9511,0.0001), #Fp1
                 'P4':(0.5401,-0.6724,0.5045),
                 'P8':(0.8090,-0.5878,-0.0001),
                 'O2':(0.3090,-0.9511,0.0000),
-                'TP9':(-0.8777,-0.2852,-0.3826),
-                'TP10':(0.8777,-0.2853,-0.3826),
+                # 'TP9':(-0.8777,-0.2852,-0.3826),
+                # 'TP10':(0.8777,-0.2853,-0.3826),
                 
-                'Fp1':(-0.3090,0.9511,0.0001),
-                'AFF5h':(-0.5417,0.7777,0.3163),
-                'Fp2':(0.3091,0.9511,0.0000),
-                'AFF6h':(0.5417,0.7777,0.3163),}
+                # 'Fp1':(-0.3090,0.9511,0.0001),
+                # 'AFF5h':(-0.5417,0.7777,0.3163),
+                # 'Fp2':(0.3091,0.9511,0.0000),
+                # 'AFF6h':(0.5417,0.7777,0.3163),
+                }
 
 # NIRS Ccoordinates
 NIRS_COORDS = {
@@ -243,7 +245,7 @@ NIRS_COORDS = {
 
 # EEG Channels names
 EEG_CHANNEL_NAMES = ['FP1', 
-                    'AFF5h', 
+                    'AFF5', #AFF5h
                     'AFz', 
                     'F1', 
                     'FC5', 
@@ -259,7 +261,7 @@ EEG_CHANNEL_NAMES = ['FP1',
                     'POz', 
                     'O1',  
                     'FP2', 
-                    'AFF6h',
+                    'AFF6', #AFF6h
                     'F2', 
                     'FC2', 
                     'FC6', 
@@ -270,8 +272,9 @@ EEG_CHANNEL_NAMES = ['FP1',
                     'P4', 
                     'P8', 
                     'O2',
-                    'HEOG',
-                    'VEOG']
+                    # 'HEOG',
+                    # 'VEOG',
+                    ]
 
 
 # Fake source detector IDS

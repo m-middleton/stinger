@@ -2,6 +2,12 @@ import time
 import numpy as np
 
 from scipy.ndimage import gaussian_filter
+from scipy.spatial.distance import cdist
+
+def calculate_channel_distances(target_coords, input_coords):
+    target_positions = np.array(target_coords)
+    input_positions = np.array(input_coords)
+    return cdist(input_positions, target_positions)
 
 def translate_channel_name_to_ch_id(channel_names, nirs_coords, channel_ids):
     translated_ids = []

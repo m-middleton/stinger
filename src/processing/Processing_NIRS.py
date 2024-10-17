@@ -26,7 +26,7 @@ def nirs_ica_artifact_rejection(raw_intensity):
 
     return ica
 
-def process_nirs_epochs(raw_haemo, t_max, t_min, baseline_correction=[None,0]):
+def process_nirs_epochs(raw_haemo, t_min, t_max, baseline_correction=[None,0]):
     events, single_events_dict = mne.events_from_annotations(raw_haemo)
 
     # Uncomment this for event processing

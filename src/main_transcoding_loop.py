@@ -1,50 +1,48 @@
 '''
-
 '''
 
 import sys
 sys.path.insert(1, '../')
 
 import os
-import joblib
+import csv
+import gc
+import random
+import json
+from datetime import datetime
+import io
 
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
+from PIL import Image
 
-import mne
-# from mne import events_from_annotations, concatenate_raws
-from sklearn.metrics import r2_score
-
-import torch
-from torch.utils.data import DataLoader
-
-import csv
-from sklearn.metrics import r2_score
+import concurrent.futures
+from functools import partial
 
 import torch
 from torch.optim import Adam
 from torch.utils.data import DataLoader
+from sklearn.metrics import r2_score
+import concurrent.futures
 
-import gc
+import wandb
+
+from processing.Format_Data import grab_ordered_windows, grab_random_windows, SignalData  # Updated
+from tokenization.FPCA import MultiChannelFPCA
+from tokenization.Raw_Tokenization import RawTokenizer
+from utilities.Read_Data import get_data_nirs_eeg, get_data_eeg_to_eeg
+from models.Model_Utilities import predict_signal, create_rnn, create_mlp, create_transformer  # Updated
+from utilities.utilities import calculate_channel_distances
+from utilities.Plotting import plot_scatter_between_timepoints, compare_real_vs_predicted_erp
+from plotting.Windowed_Correlation import rolling_correlation, process_channel_rolling_correlation
 
 from config.Constants import *
-
-from processing.CCA import perform_fpca_over_channels, get_fpca_dict
-from processing.Format_Data import grab_ordered_windows, grab_random_windows, find_indices, EEGfNIRSData
-from processing.FPCA import perform_fpca_over_channels, get_fpca_dict, plot_explained_variance_over_dict
-from processing.CCA import perform_fpca_over_channels, get_fpca_dict
-
-from utilities.Read_Data import read_matlab_file
-from utilities.Model_Utilities import predict_eeg, create_rnn, create_mlp, create_transformer
-
-from plotting.Windowed_Correlation import rolling_correlation
-
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f'Device: {DEVICE}')
 
-# create directorys if they dont exist
+# create directories if they don't exist
 if not os.path.exists(MODEL_WEIGHTS):
     os.makedirs(MODEL_WEIGHTS)
 if not os.path.exists(OUTPUT_DIRECTORY):
@@ -55,430 +53,740 @@ model_functions = {
     'mlp': create_mlp,
     'transformer': create_transformer
 }
-loss_amounts = {
-    'rnn': 0.01,
-    'mlp': 0.001,
-    'transformer': 0.01
+data_functions = {
+    'get_data_nirs_eeg': get_data_nirs_eeg,
+    'get_data_eeg_to_eeg': get_data_eeg_to_eeg
 }
 
-def run_model(subject_id_int,
-              model_name_base, 
-              nirs_channels_to_use_base, 
-              eeg_channels_to_use, 
-              eeg_channel_index, 
-              nirs_channel_index, 
-              num_epochs, 
-              redo_train=False):
-    model_function = model_functions[model_name_base]
-    loss_amount = loss_amounts[model_name_base]
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def save_config(
+        subject_id, 
+        model_config, 
+        data_config, 
+        training_config, 
+        visualization_config
+):
+    # Convert all config values to strings
+    def stringify_config(config):
+        if isinstance(config, dict):
+            return {k: stringify_config(v) for k, v in config.items()}
+        elif isinstance(config, list):
+            return [stringify_config(item) for item in config]
+        else:
+            return str(config)
+
+    model_config = stringify_config(model_config)
+    data_config = stringify_config(data_config)
+    training_config = stringify_config(training_config)
+    visualization_config = stringify_config(visualization_config)
+
+    # Create a dictionary containing all configurations
+    config = {
+        "subject_id": subject_id,
+        "model_config": model_config,
+        "data_config": data_config,
+        "training_config": training_config,
+        "visualization_config": visualization_config
+    }
+    
+    # Get the output path from visualization_config
+    output_path = visualization_config['output_path']
+    
+    # Create a filename for the config log
+    config_filename = f"config_log_subject_{subject_id}.json"
+    
+    # Full path for the config log file
+    config_file_path = os.path.join(output_path, config_filename)
+    
+    # Save the config dictionary as a JSON file
+    with open(config_file_path, 'w') as f:
+        json.dump(config, f, indent=4)
+    
+    print(f"Configuration saved to: {config_file_path}")
+
+def run_model(subject_id_int, model_name, model_config, data_config, training_config, visualization_config):
     subject_id = f'{subject_id_int:02d}'
-    model_name = f'{model_name_base}_{subject_id}'
-    final_model_path = os.path.join(MODEL_WEIGHTS, f'{model_name}_{num_epochs}.pth')
-    if os.path.exists(final_model_path) and not redo_train:
+    final_model_path = os.path.join(MODEL_WEIGHTS, f'{model_name}_{training_config["num_epochs"]}.pth')
+    
+    if visualization_config['do_wandb']:
+        # Initialize wandb
+        wandb.init(project="signal-transcoding",
+                   name=model_name,
+                   config={**model_config, **data_config, **training_config, **visualization_config})
+    
+    if os.path.exists(final_model_path) and not training_config['redo_train']:
         print(f'Model name exists, skipping {model_name}')
     else:
         print(f'Starting {model_name}')
-        model = model_function(len(nirs_channels_to_use_base)*nirs_token_size, len(eeg_channels_to_use)*eeg_token_size)
-            
-        # Pre-allocate memory for training and testing data
-        eeg_data, nirs_data, mrk_data = read_matlab_file(subject_id)
 
-        print(f'EEG Shape: {eeg_data.shape}')
-        print(f'NIRS Shape: {nirs_data.shape}')
-        print(f'MRK Shape: {mrk_data.shape}')
-
-        # split train and test on eeg_data, nirs_data, and mrk_data
-        test_size = int(eeg_data.shape[1]*test_size_in_subject)
-        train_size = eeg_data.shape[1] - test_size
-
-        train_eeg_data = eeg_data[:, :train_size]
-        train_nirs_data = nirs_data[:, :train_size]
-        # train_mrk_data = mrk_data[:, :train_size]
-
-        test_eeg_data = eeg_data[:, train_size:]
-        test_nirs_data = nirs_data[:, train_size:]
-        # test_mrk_data = mrk_data[:, train_size:]
-
-        # get CA dict
-        # cca_dict = get_cca_dict(subject_id, train_nirs_data, train_eeg_data, token_size)
-        fpca_dict = get_fpca_dict(subject_id, train_nirs_data, train_eeg_data, nirs_token_size, eeg_token_size)
-        eeg_fpcas = fpca_dict['eeg']
-        nirs_fpcas = fpca_dict['nirs']
-
-        # plot variance explained
-        plot_explained_variance_over_dict(nirs_fpcas, path=os.path.join(OUTPUT_DIRECTORY, f'variance_{model_name}_nirs_fpca.jpeg'), channel_names=nirs_channels_to_use_base)
-        plot_explained_variance_over_dict(eeg_fpcas, path=os.path.join(OUTPUT_DIRECTORY, f'variance_{model_name}_eeg_fpca.jpeg'), channel_names=eeg_channels_to_use)
-
-        # Train data
-        eeg_windowed_train, nirs_windowed_train, meta_data = grab_random_windows(
-                        nirs_data=train_nirs_data, 
-                        eeg_data=train_eeg_data,
-                        sampling_rate=200,
-                        nirs_t_min=nirs_t_min, 
-                        nirs_t_max=nirs_t_max,
-                        eeg_t_min=0, 
-                        eeg_t_max=1,
-                        number_of_windows=10000)
+        data_dict, input_sample_rate, target_sample_rate, single_events_dict = data_functions[data_config['get_data_function']](
+            subject_id_int, 
+            data_config, 
+            training_config)
         
-        eeg_windowed_train = eeg_windowed_train[:, :, :eeg_lookback]
-        nirs_windowed_train = nirs_windowed_train[:, :, :fnirs_lookback]
+        input_coordinates = torch.from_numpy(data_dict['input_coordinates']).float()
+        target_coordinates = torch.from_numpy(data_dict['target_coordinates']).float()
 
-        # nirs_windowed_train = perform_cca_over_channels(nirs_windowed_train, cca_dict, token_size)
-        # eeg_windowed_train = perform_cca_over_channels(eeg_windowed_train, cca_dict, token_size)
-        nirs_windowed_train = perform_fpca_over_channels(nirs_windowed_train, nirs_fpcas, nirs_token_size)
-        eeg_windowed_train = perform_fpca_over_channels(eeg_windowed_train, eeg_fpcas, eeg_token_size)
+        # Calculate spatial bias (if needed)
+        spatial_bias = torch.from_numpy(calculate_channel_distances(data_dict['input_coordinates'], data_dict['target_coordinates'])).float()
 
-        n_channels = nirs_windowed_train.shape[1]
-        # # plot channels
-        # fig, axs = plt.subplots(n_channels, 1, figsize=(10, 10))
-        # for i in range(n_channels):
-        #     axs[i].plot(nirs_windowed_train[0, i, :])
-        # plt.show()
+        # Model creation and training
+        model_params = {k: v for k, v in model_config.items() if k != 'name'}
+        model = model_functions[model_config['name']](
+            n_input=len(data_config['input_channel_names']) * data_config['input_token_size'],
+            n_output=len(data_config['target_channel_names']) * data_config['target_token_size'],
+            input_sequence_length=data_config['input_token_size'],
+            target_sequence_length=data_config['target_token_size'],
+            num_input_channels=len(data_config['input_channel_names']),
+            num_target_channels=len(data_config['target_channel_names']),
+            **model_params
+        )
 
-        # Append to the preallocated arrays
-        eeg_windowed_train = eeg_windowed_train.transpose(0,2,1)
-        nirs_windowed_train = nirs_windowed_train.transpose(0,2,1)
-    
-        eeg_windowed_train = eeg_windowed_train[:,:, eeg_channel_index]
-        nirs_windowed_train = nirs_windowed_train[:,:, nirs_channel_index]
-
-        print(f'EEG Train Shape: {eeg_windowed_train.shape}')
-        print(f'NIRS Train Shape: {nirs_windowed_train.shape}')
+        # Window data
+        
+        # Train data
+        input_windowed_train, target_windowed_train, meta_data = grab_random_windows(
+            input_signal=data_dict['train_input_signal'], 
+            target_signal=data_dict['train_target_signal'],
+            input_sample_rate=input_sample_rate,
+            target_sample_rate=target_sample_rate,
+            input_t_min=data_config['input_t_min'],
+            input_t_max=data_config['input_t_max'],
+            target_t_min=data_config['target_t_min'],
+            target_t_max=data_config['target_t_max'],
+            number_of_windows=training_config['num_train_windows'])
 
         # Train data in order for visualization
-        eeg_windowed_train_ordered, nirs_windowed_train_ordered, meta_data = grab_ordered_windows(
-            nirs_data=train_nirs_data, 
-            eeg_data=train_eeg_data,
-            sampling_rate=200,
-            nirs_t_min=nirs_t_min, 
-            nirs_t_max=nirs_t_max,
-            eeg_t_min=0, 
-            eeg_t_max=1)
-    
-        eeg_windowed_train = eeg_windowed_train[:, :, :eeg_lookback]
-        nirs_windowed_train = nirs_windowed_train[:, :, :fnirs_lookback]
-                
-        # nirs_windowed_test = perform_cca_over_channels(nirs_windowed_test, cca_dict, token_size)
-        nirs_windowed_train_ordered = perform_fpca_over_channels(nirs_windowed_train_ordered, nirs_fpcas, nirs_token_size)
+        input_windowed_train_ordered, target_windowed_train_ordered, meta_data, train_event_data_ordered = grab_ordered_windows(
+            input_signal=data_dict['train_input_signal'], 
+            target_signal=data_dict['train_target_signal'],
+            input_sample_rate=input_sample_rate,
+            target_sample_rate=target_sample_rate,
+            input_t_min=data_config['input_t_min'],
+            input_t_max=data_config['input_t_max'],
+            target_t_min=data_config['target_t_min'],
+            target_t_max=data_config['target_t_max'],
+            events=data_dict['train_mrk_data'])
         
-        eeg_windowed_train_ordered = eeg_windowed_train_ordered.transpose(0,2,1)
-        nirs_windowed_train_ordered = nirs_windowed_train_ordered.transpose(0,2,1)
-    
-        eeg_windowed_train_ordered = eeg_windowed_train_ordered[:,:, eeg_channel_index]
-        nirs_windowed_train_ordered = nirs_windowed_train_ordered[:,:, nirs_channel_index]
-
-        print(f'EEG Train Ordered Shape: {eeg_windowed_train_ordered.shape}')
-        print(f'NIRS Train Ordered Shape: {nirs_windowed_train_ordered.shape}')
+        # Validation data in order
+        input_windowed_validation, target_windowed_validation, meta_data, validation_event_data_ordered = grab_ordered_windows(
+            input_signal=data_dict['validation_input_signal'], 
+            target_signal=data_dict['validation_target_signal'],
+            input_sample_rate=input_sample_rate,
+            target_sample_rate=target_sample_rate,
+            input_t_min=data_config['input_t_min'],
+            input_t_max=data_config['input_t_max'],
+            target_t_min=data_config['target_t_min'],
+            target_t_max=data_config['target_t_max'],
+            events=data_dict['validation_mrk_data'])
 
         # Test data
-        eeg_windowed_test, nirs_windowed_test, meta_data = grab_ordered_windows(
-                    nirs_data=test_nirs_data, 
-                    eeg_data=test_eeg_data,
-                    sampling_rate=200,
-                    nirs_t_min=nirs_t_min,
-                    nirs_t_max=nirs_t_max,
-                    eeg_t_min=0, 
-                    eeg_t_max=1)
-        
-        eeg_windowed_train = eeg_windowed_train[:, :, :eeg_lookback]
-        nirs_windowed_train = nirs_windowed_train[:, :, :fnirs_lookback]
+        input_windowed_test, target_windowed_test, meta_data, test_event_data_ordered = grab_ordered_windows(
+            input_signal=data_dict['test_input_signal'], 
+            target_signal=data_dict['test_target_signal'],
+            input_sample_rate=input_sample_rate,
+            target_sample_rate=target_sample_rate,
+            input_t_min=data_config['input_t_min'],
+            input_t_max=data_config['input_t_max'],
+            target_t_min=data_config['target_t_min'],
+            target_t_max=data_config['target_t_max'],
+            events=data_dict['test_mrk_data'])
 
-        # nirs_windowed_test = perform_cca_over_channels(nirs_windowed_test, cca_dict, token_size)
-        nirs_windowed_test = perform_fpca_over_channels(nirs_windowed_test, nirs_fpcas, nirs_token_size)
+        # Tokenization
+        if data_config['tokenization'] == 'raw':
+            # Use raw data without tokenization
+            # uses a fake tokenizer
+            tokenizer = RawTokenizer(
+                subject_id=subject_id, 
+                model_weights=MODEL_WEIGHTS,
+                redo_tokenization=data_config['redo_tokenization']
+            )
+            
+        elif data_config['tokenization'] == 'fpca':
+            tokenizer = MultiChannelFPCA(
+                subject_id=subject_id, 
+                model_weights=MODEL_WEIGHTS,
+                redo_tokenization=data_config['redo_tokenization']
+            )
+        else:
+            raise ValueError(f"Unknown tokenization method: {data_config['tokenization']}")
         
-        eeg_windowed_test = eeg_windowed_test.transpose(0,2,1)
-        nirs_windowed_test = nirs_windowed_test.transpose(0,2,1)
+        # Tokenization Steps
+        tokenizer.fit(
+            train_input_signal=data_dict['train_input_signal'], 
+            train_target_signal=data_dict['train_target_signal'], 
+            input_token_size=data_config['input_token_size'],
+            target_token_size=data_config['target_token_size'],
+            input_sample_rate=input_sample_rate,
+            target_sample_rate=target_sample_rate,
+            input_channel_names=data_config['input_channel_names'],
+            target_channel_names=data_config['target_channel_names'],
+            input_t_min=data_config['input_t_min'],
+            input_t_max=data_config['input_t_max'],
+            target_t_min=data_config['target_t_min'],
+            target_t_max=data_config['target_t_max']
+        )
+
+        # Tokenization Training
+        input_windowed_train = tokenizer.tokenize(data=input_windowed_train,signal_type='input')
+        target_windowed_train = tokenizer.tokenize(data=target_windowed_train,signal_type='target')
+
+        # Tokenization Testing
+        input_windowed_train_ordered = tokenizer.tokenize(data=input_windowed_train_ordered,signal_type='input')
+        input_windowed_validation = tokenizer.tokenize(data=input_windowed_validation,signal_type='input')
+        input_windowed_test = tokenizer.tokenize(data=input_windowed_test,signal_type='input')
+
+        n_input_channels = input_windowed_train.shape[1]
+        n_target_channels = target_windowed_train.shape[1]
+
+        # Transpose data to match expected input shape
+        target_windowed_train = target_windowed_train.transpose(0, 2, 1)
+        input_windowed_train = input_windowed_train.transpose(0, 2, 1)
+        
+        target_windowed_train_ordered = target_windowed_train_ordered.transpose(0, 2, 1)
+        input_windowed_train_ordered = input_windowed_train_ordered.transpose(0, 2, 1)
+
+        target_windowed_validation = target_windowed_validation.transpose(0, 2, 1)
+        input_windowed_validation = input_windowed_validation.transpose(0, 2, 1)
+
+        target_windowed_test = target_windowed_test.transpose(0, 2, 1)
+        input_windowed_test = input_windowed_test.transpose(0, 2, 1)
+
+        print(f'Tokenized Target Train Shape: {target_windowed_train.shape}')
+        print(f'Tokenized Input Train Shape: {input_windowed_train.shape}')
+
+        print(f'Train Target Ordered Shape: {target_windowed_train_ordered.shape}')
+        print(f'Train Input Ordered Shape: {input_windowed_train_ordered.shape}')
+
+        print(f'Validation Target Shape: {target_windowed_validation.shape}')
+        print(f'Validation Input Tokenized Shape: {input_windowed_validation.shape}')
+
+        print(f'Test Target Shape: {target_windowed_test.shape}')
+        print(f'Test Input Tokenized Shape: {input_windowed_test.shape}')
+
+        data_dict = {
+            'target_windowed_train': target_windowed_train,
+            'input_windowed_train': input_windowed_train,
+            'target_windowed_train_ordered': target_windowed_train_ordered,
+            'input_windowed_train_ordered': input_windowed_train_ordered,
+            'target_windowed_validation': target_windowed_validation,
+            'input_windowed_validation': input_windowed_validation,
+            'target_windowed_test': target_windowed_test,
+            'input_windowed_test': input_windowed_test,
+            'validation_event_data_ordered': validation_event_data_ordered,
+            'test_event_data_ordered': test_event_data_ordered,
+            'train_event_data_ordered': train_event_data_ordered,
+            'spatial_bias': spatial_bias,
+            'tokenizer': tokenizer,
+            'input_coordinates': input_coordinates,
+            'target_coordinates': target_coordinates
+        }
+
+        if training_config['do_train']:
+            train_model(model, 
+                        data_dict=data_dict,
+                        model_name=model_name,
+                        input_token_size=data_config['input_token_size'],
+                        target_token_size=data_config['target_token_size'],
+                        input_channel_names=data_config['input_channel_names'],
+                        target_channel_names=data_config['target_channel_names'],
+                        visualization_config=visualization_config,
+                        config=training_config)
+
+        # Evaluation and plotting
+        evaluate_and_plot(model, 
+                          tokenizer=tokenizer,
+                          data_dict=data_dict,
+                          single_events_dict=single_events_dict,
+                          model_name=model_name,
+                          data_config=data_config,
+                          visualization_config=visualization_config)
+        
+        if visualization_config['do_wandb']:
+            wandb.finish()
+
+def train_model(model, 
+                data_dict,
+                model_name,
+                input_token_size,
+                target_token_size,
+                input_channel_names,
+                target_channel_names,
+                visualization_config,
+                config):
+    model.to(DEVICE)
+
+    input_train_tensor = data_dict['input_windowed_train']
+    target_train_tensor = data_dict['target_windowed_train']
     
-        eeg_windowed_test = eeg_windowed_test[:,:, eeg_channel_index]
-        nirs_windowed_test = nirs_windowed_test[:,:, nirs_channel_index]
+    input_train_tensor = torch.from_numpy(input_train_tensor).float()
+    target_train_tensor = torch.from_numpy(target_train_tensor).float()
+    
+    dataset = SignalData(input_train_tensor, target_train_tensor)
+    train_loader = DataLoader(dataset, batch_size=32, shuffle=True)
 
-        print(f'EEG Test Shape: {eeg_windowed_test.shape}')
-        print(f'NIRS Test Shape: {nirs_windowed_test.shape}')
+    # Validation data
+    input_validation_tensor = torch.from_numpy(data_dict['input_windowed_validation']).float()
+    target_validation_tensor = torch.from_numpy(data_dict['target_windowed_validation']).float()
 
-        # Perform inference on test
-        nirs_test_tensor = nirs_windowed_test.reshape(-1, len(nirs_channel_index)*nirs_token_size)
+    validation_dataset = SignalData(input_validation_tensor, target_validation_tensor)
+    validation_loader = DataLoader(validation_dataset, batch_size=32, shuffle=True)
+    
+    latest_epoch = 0
+    loss_list = []
+    if config['do_load']:
+        model_path = f'{model_name}_epoch_1.pth'
 
-        nirs_test_tensor = torch.from_numpy(nirs_test_tensor).float()
-        eeg_test_tensor = torch.from_numpy(eeg_windowed_test).float()
+        # Find the latest model
+        for file in os.listdir(MODEL_WEIGHTS):
+            if file.startswith(f'{model_name}_epoch_'):
+                epoch = int(file.split('_')[-1].split('.')[0])
+                if epoch > latest_epoch:
+                    latest_epoch = epoch
+                    model_path = file
+        print(f'Using Model Weights: {model_path}')
+        model.load_state_dict(torch.load(os.path.join(MODEL_WEIGHTS, model_path)))
+    
+        # Load loss list
+        with open(os.path.join(MODEL_WEIGHTS, f'loss_{model_name}_{latest_epoch}.csv'), 'r') as file_ptr:
+            reader = csv.reader(file_ptr)
+            loss_list = list(reader)[0]
+        print(f'Last loss: {float(loss_list[-1])/len(train_loader):.4f}')
 
-        test_dataset = EEGfNIRSData(nirs_test_tensor, eeg_test_tensor)
-        test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+    # Optimizer and loss function
+    optimizer = Adam(model.parameters(), lr=config['learning_rate'])
+    loss_function = torch.nn.MSELoss()
 
-        if do_train:
-            # flatten channels and tokens
-            nirs_train_tensor = nirs_windowed_train.reshape(-1, len(nirs_channel_index)*nirs_token_size)
-            eeg_train_tensor = eeg_windowed_train.reshape(-1, len(eeg_channel_index)*eeg_token_size)
+    train_validation_loss_dict = {'train':[], 'validation':[]}
+    for epoch in range(latest_epoch, config['num_epochs']):
+        model.train()
+        total_loss = 0
+
+        for batch_idx, (X_batch, y_batch) in enumerate(train_loader):
+            X_batch = X_batch.to(DEVICE).float()
+            y_batch = y_batch.to(DEVICE).float()
+            input_signal_coordinates = data_dict['input_coordinates'].to(DEVICE).float()
+            target_signal_coordinates = data_dict['target_coordinates'].to(DEVICE).float()
+
+            # Forward pass
+            predictions = model(X_batch, input_signal_coordinates, target_signal_coordinates)
+            predictions = predictions.reshape(y_batch.shape)
+
+            # Loss calculation
+            loss = loss_function(predictions, y_batch)
+
+            # Backpropagation
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+        
+        loss_list.append(total_loss)
+
+        if visualization_config['do_wandb']:
+            # Log to wandb
+            wandb.log({"train_loss": total_loss / len(train_loader), "epoch": epoch + 1})
+
+        if (epoch+1) % 50 == 0:
+            # Save model weights
+            torch.save(model.state_dict(), os.path.join(MODEL_WEIGHTS, f'{model_name}_{epoch+1}.pth'))
+            with open(os.path.join(MODEL_WEIGHTS,f'loss_{model_name}_{epoch+1}.csv'), 'w', newline='') as file_ptr:
+                wr = csv.writer(file_ptr, quoting=csv.QUOTE_ALL)
+                wr.writerow(loss_list)
+
+            targets, predictions = predict_signal(model, 
+                                                  data_loader=validation_loader, 
+                                                  spatial_bias=data_dict['spatial_bias'],
+                                                  input_coordinates=data_dict['input_coordinates'],
+                                                  target_coordinates=data_dict['target_coordinates'],
+                                                  n_samples=data_dict['target_windowed_validation'].shape[0], 
+                                                  n_channels=data_dict['target_windowed_validation'].shape[2], 
+                                                  n_lookback=data_dict['target_windowed_validation'].shape[1],
+                                                  target_token_size=target_token_size,
+                                                  tokenizer=data_dict['tokenizer'])
+
+            all_r2 = []
+            for channel_id in range(len(target_channel_names)):
+                targets_single = targets[:, :, channel_id]
+                predictions_single = predictions[:, :, channel_id]
+
+                target_average = np.mean(targets_single, axis=0)
+                prediction_average = np.mean(predictions_single, axis=0)
+
+                r2 = r2_score(target_average, prediction_average)
+                all_r2.append(r2)
+        
+            total_r2 = np.max(all_r2)
+            train_validation_loss_dict['train'].append(total_loss / len(train_loader))
+            train_validation_loss_dict['validation'].append(total_r2)
+
+            if visualization_config['do_wandb']:
+                # Log to wandb
+                wandb.log({
+                    "validation_r2": total_r2,
+                })
+
+            print(f'Epoch: {epoch+1}, Train Loss: {total_loss / len(train_loader):.10f}, Validation R2: {total_r2:.10f}')
+        elif (epoch+1) % 10 == 0:
+            print(f'Epoch: {epoch+1}, Average Loss: {total_loss / len(train_loader):.10f}')
+
+    return model
+
+def process_single_channel_data(i, channel_name, targets_train, predictions_train, targets_test, predictions_test, 
+                                targets_train_flat, predictions_train_flat, targets_test_flat, predictions_test_flat, 
+                                data_dict, single_events_dict, visualization_config, data_config):
+    
+    results = {}
+    results['channel_name'] = channel_name
+    results['i'] = i
+    
+    # Prepare data for rolling correlation plots
+    results['rolling_corr_data'] = []
+    for targets, predictions, type_label in [
+        (targets_train, predictions_train, 'Train'),
+        (targets_test, predictions_test, 'Test')
+    ]:
+        targets_single = targets[:,:,i].reshape(1, -1)
+        predictions_single = predictions[:,:,i].reshape(1, -1)
+        results['rolling_corr_data'].append((targets_single, predictions_single, type_label))
+
+    # Prepare data for scatter plots
+    results['scatter_data'] = {
+        'train': (targets_train_flat[:, i].reshape(-1, 1), predictions_train_flat[:, i].reshape(-1, 1)),
+        'test': (targets_test_flat[:, i].reshape(-1, 1), predictions_test_flat[:, i].reshape(-1, 1))
+    }
+
+    # Prepare data for ERP plots
+    results['erp_data'] = []
+    for targets, predictions, events, label in [
+        (targets_train_flat[:, i].reshape(1, -1), predictions_train_flat[:, i].reshape(1, -1), data_dict['train_event_data_ordered'], 'Train'),
+        (targets_test_flat[:, i].reshape(1, -1), predictions_test_flat[:, i].reshape(1, -1), data_dict['test_event_data_ordered'], 'Test')
+    ]:
+        results['erp_data'].append((targets, predictions, events, label))
+
+    print(f'Finished processing data for Channel: {channel_name} ({i+1}/{len(data_config["target_channel_names"])})')
+    return results
+
+def evaluate_and_plot(model, 
+                      tokenizer,
+                      data_dict,
+                      single_events_dict,
+                      model_name, 
+                      data_config,
+                      visualization_config):
+    # Perform inference on ordered train
+    input_train_tensor = torch.from_numpy(data_dict['input_windowed_train_ordered']).float()
+    target_train_tensor = torch.from_numpy(data_dict['target_windowed_train_ordered']).float()
+
+    train_dataset = SignalData(input_train_tensor, target_train_tensor)
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
+
+    # Perform inference on ordered test
+    input_test_tensor = torch.from_numpy(data_dict['input_windowed_test']).float()
+    target_test_tensor = torch.from_numpy(data_dict['target_windowed_test']).float()
+
+    test_dataset = SignalData(input_test_tensor, target_test_tensor)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+
+    # Channel indexes to use
+    channels_to_use_dict = {channel_name: data_config['target_channel_names'].index(channel_name) for channel_name in visualization_config['channel_names']}
+    
+    # Get weights for specific epoch
+    for weight_epoch in visualization_config['weight_epochs']:
+        model_path = f'{model_name}_{weight_epoch}.pth'
+        model.load_state_dict(torch.load(os.path.join(MODEL_WEIGHTS, model_path)))
+        model.to(DEVICE)
+
+        model.eval()
+
+        targets_train, predictions_train = predict_signal(model, 
+                                            data_loader=train_loader, 
+                                            spatial_bias=data_dict['spatial_bias'], 
+                                            input_coordinates=data_dict['input_coordinates'],
+                                            target_coordinates=data_dict['target_coordinates'],
+                                            n_samples=data_dict['target_windowed_train_ordered'].shape[0], 
+                                            n_channels=data_dict['target_windowed_train_ordered'].shape[2], 
+                                            n_lookback=data_dict['target_windowed_train_ordered'].shape[1],
+                                            target_token_size=data_config['target_token_size'],
+                                            tokenizer=tokenizer)
+        targets_test, predictions_test = predict_signal(model, 
+                                            data_loader=test_loader, 
+                                            spatial_bias=data_dict['spatial_bias'], 
+                                            input_coordinates=data_dict['input_coordinates'],
+                                            target_coordinates=data_dict['target_coordinates'],
+                                            n_samples=data_dict['target_windowed_test'].shape[0], 
+                                            n_channels=data_dict['target_windowed_test'].shape[2], 
+                                            n_lookback=data_dict['target_windowed_test'].shape[1],
+                                            target_token_size=data_config['target_token_size'],
+                                            tokenizer=tokenizer)
+        
+        channel_names = list(channels_to_use_dict.keys())
+        channel_indexes = list(channels_to_use_dict.values())
+        targets_train = targets_train[:, :, channel_indexes]
+        predictions_train = predictions_train[:, :, channel_indexes]
+        targets_test = targets_test[:, :, channel_indexes]
+        predictions_test = predictions_test[:, :, channel_indexes]
+        
+        print(f'Weight Epoch: {weight_epoch}')
+        print(f'Train Predictions Shape: {predictions_train.shape}')
+        print(f'Train Targets Shape: {targets_train.shape}')
+        print(f'Test Predictions Shape: {predictions_test.shape}')
+        print(f'Test Targets Shape: {targets_test.shape}')
+    
+        # scipy.io.savemat(os.path.join(visualization_config['output_path'], f'test_{model_name}_{weight_epoch}.mat'), {'X': targets, 
+        #                                                         'XPred':predictions,
+        #                                                     'bins':10,
+        #                                                     'scale':10,
+        #                                                     'srate':200})
+        
+        ''' Combine all evaluation plots into a single figure '''
+        num_channels = len(channels_to_use_dict)
+        num_plot_types = 5  # Rolling correlation (train/test), Scatter (2 subplots), ERP (1 subplot)
+        fig, axs = plt.subplots(num_channels, num_plot_types, figsize=(30, 10*num_channels), squeeze=False)
+        
+        highest_correlation = 0
+        print(f'Plotting combined evaluation for {num_channels} channels')
+
+        # Pre-compute channel labels
+        channel_labels = list(channels_to_use_dict.keys())
+
+        # Flatten the data for ERP and scatter plots
+        targets_train_flat = targets_train.reshape(targets_train.shape[0] * targets_train.shape[1], -1)
+        predictions_train_flat = predictions_train.reshape(predictions_train.shape[0] * predictions_train.shape[1], -1)
+        targets_test_flat = targets_test.reshape(targets_test.shape[0] * targets_test.shape[1], -1)
+        predictions_test_flat = predictions_test.reshape(predictions_test.shape[0] * predictions_test.shape[1], -1)
+
+        num_channels = len(channels_to_use_dict)
+        num_plot_types = 5
+        fig, axs = plt.subplots(num_channels, num_plot_types, figsize=(30, 10*num_channels), squeeze=False)
+
+        highest_correlation = 0
+        print(f'Processing rolling correlations for {num_channels} channels')
+
+        # Pre-compute channel labels
+        channel_labels = list(channels_to_use_dict.keys())
+
+        # Flatten the data for scatter plots
+        targets_train_flat = targets_train.reshape(targets_train.shape[0] * targets_train.shape[1], -1)
+        predictions_train_flat = predictions_train.reshape(predictions_train.shape[0] * predictions_train.shape[1], -1)
+        targets_test_flat = targets_test.reshape(targets_test.shape[0] * targets_test.shape[1], -1)
+        predictions_test_flat = predictions_test.reshape(predictions_test.shape[0] * predictions_test.shape[1], -1)
+
+        # Prepare the partial function for multiprocessing
+        process_func = partial(
+            process_channel_rolling_correlation,
+            targets_train=targets_train,
+            predictions_train=predictions_train,
+            targets_test=targets_test,
+            predictions_test=predictions_test,
+            data_config=data_config
+        )
+
+        # Use ThreadPoolExecutor for parallel processing
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            # Submit all tasks
+            future_to_channel = {executor.submit(process_func, channel_name, i): (channel_name, i) 
+                                for i, channel_name in enumerate(channel_labels)}
             
-            nirs_train_tensor = torch.from_numpy(nirs_train_tensor).float()
-            eeg_train_tensor = torch.from_numpy(eeg_train_tensor).float()
-            meta_data_tensor = torch.from_numpy(np.array(meta_data)).float()
-            
-            print(nirs_train_tensor.shape)
-            print(eeg_train_tensor.shape)
-            
-            dataset = EEGfNIRSData(nirs_train_tensor, eeg_train_tensor)
-            dataloader = DataLoader(dataset, batch_size=500, shuffle=True)
-        
-            latest_epoch = 0
-            loss_list = []
-            if do_load:
-                model_path = f'{model_name}_epoch_1.pth'
-        
-                # find the latest model
-                for file in os.listdir(MODEL_WEIGHTS):
-                    if file.startswith(f'{model_name}_epoch_'):
-                        epoch = int(file.split('_')[-1].split('.')[0])
-                        if epoch > latest_epoch:
-                            latest_epoch = epoch
-                            model_path = file
-                print(f'Using Model Weights: {model_path}')
-                model.load_state_dict(torch.load(os.path.join(MODEL_WEIGHTS, model_path)))
-            
-                # load loss list
-                with open(os.path.join(MODEL_WEIGHTS, f'loss_{model_name}_{latest_epoch}.csv'), 'r') as file_ptr:
-                    reader = csv.reader(file_ptr)
-                    loss_list = list(reader)[0]
-                print(f'Last loss: {float(loss_list[-1])/len(dataloader):.4f}')
-        
-            model.to(DEVICE)
-        
-            # Optimizer and loss function
-            optimizer = Adam(model.parameters(), lr=loss_amount)
-            loss_function = torch.nn.MSELoss()
-            train_test_loss_dicct = {'train':[], 'test':[]}
-            for epoch in range(latest_epoch, num_epochs):
-                model.train()
-                total_loss = 0
-        
-                for batch_idx, (X_batch, y_batch) in enumerate(dataloader):
-                    X_batch = X_batch.to(DEVICE).float()
-                    y_batch = y_batch.to(DEVICE).float()
-                    
-                    # Forward pass
-                    predictions = model(X_batch)
-        
-                    # Loss calculation
-                    loss = loss_function(predictions, y_batch)
-        
-                    # Backpropagation
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-        
-                    total_loss += loss.item()
-                    # if (batch_idx+1) % 20 == 0 or batch_idx == 0:
-                    #     print(f'Epoch: {epoch+1}, Batch: {batch_idx+1}, Loss: {loss.item():.4f}')
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(future_to_channel):
+                channel_name, i, results = future.result()
+                print(f'Finished processing for Channel: {channel_name} ({i+1}/{num_channels})')
                 
-                loss_list.append(total_loss)
-        
-                if (epoch+1) % 50 == 0:
-                    # Save model weights
-                    torch.save(model.state_dict(), os.path.join(MODEL_WEIGHTS, f'{model_name}_{epoch+1}.pth'))
-                    with open(os.path.join(MODEL_WEIGHTS,f'loss_{model_name}_{epoch+1}.csv'), 'w', newline='') as file_ptr:
-                        wr = csv.writer(file_ptr, quoting=csv.QUOTE_ALL)
-                        wr.writerow(loss_list)
+                # Plot the results
+                for j, (type_label, average_correlation, correlation_fig) in enumerate(results):
+                    # Copy the figure to the main plot
+                    correlation_ax = correlation_fig.axes[0]
+                    axs[i, j].clear()
+                    axs[i, j].imshow(correlation_ax.images[0].get_array(), aspect='auto', 
+                                    extent=correlation_ax.images[0].get_extent(),
+                                    cmap=correlation_ax.images[0].get_cmap())
+                    axs[i, j].set_xlabel(correlation_ax.get_xlabel())
+                    axs[i, j].set_ylabel(correlation_ax.get_ylabel())
                     
-                    targets, predictions = predict_eeg(model, 
-                                                    test_loader, 
-                                                    n_samples=eeg_windowed_test.shape[0], 
-                                                    n_channels=eeg_windowed_test.shape[2], 
-                                                    n_lookback=eeg_windowed_test.shape[1],
-                                                    eeg_token_size=eeg_token_size,
-                                                    eeg_fpcas=eeg_fpcas)
-                    highest_r2 = 0
-                    for channel_id in range(len(eeg_channels_to_use)):
-                        targets_single = targets[:,:,channel_id]
-                        predictions_single = predictions[:,:,channel_id]
+                    if type_label == 'Test' and average_correlation > highest_correlation:
+                        highest_correlation = average_correlation
+                    
+                    axs[i, j].set_title(f'{channel_name} {type_label}\nCorr: {average_correlation:.4f}')
+                    plt.close(correlation_fig)  # Close the individual figure to free up memory
 
-                        target_average = np.mean(targets_single, axis=0)
-                        prediction_average = np.mean(predictions_single, axis=0)
-                        r2 = r2_score(target_average, prediction_average)
-                        if r2 > highest_r2:
-                            highest_r2 = r2
-                
-                    train_test_loss_dicct['train'].append(total_loss / len(dataloader))
-                    train_test_loss_dicct['test'].append(highest_r2)
-                    print(f'Epoch: {epoch+1}, Train Loss: {total_loss / len(dataloader):.4f}, Test Loss: {highest_r2:.4f}')
-                elif (epoch+1) % 10 == 0:
-                    print(f'Epoch: {epoch+1}, Average Loss: {total_loss / len(dataloader):.4f}')
+            # Scatter plot
+            plot_scatter_between_timepoints(
+                targets_train_flat,
+                predictions_train_flat,
+                targets_test_flat,
+                predictions_test_flat,
+                [channel_name],
+                ax=axs[i, 2:4]
+            )
 
-            # Plotting train vs test loss
-            fig, axs = plt.subplots(2, 1, figsize=(18, 6))
-            axs[0].plot(train_test_loss_dicct['train'], label='Train Loss')
-            axs[1].plot(train_test_loss_dicct['test'], label='Test R2')
+            # # ERP plots
+            # number_of_events = len(visualization_config['events'])
+            # # ERP plots
+            # erp_axs = fig.add_subplot(num_channels, num_plot_types, (i*num_plot_types)+4)
+            # for j, (targets, predictions, events, label) in enumerate([
+            #     (targets_train_flat.T, predictions_train_flat.T, data_dict['train_event_data_ordered'], 'Train'),
+            #     (targets_test_flat.T, predictions_test_flat.T, data_dict['test_event_data_ordered'], 'Test')
+            # ]):
+            #     ax_number = 4 if j == 0 else 4 + number_of_events
+            #     compare_real_vs_predicted_erp(targets, 
+            #                                 predictions, 
+            #                                 events, 
+            #                                 single_events_dict, 
+            #                                 [channel_name], 
+            #                                 visualization_config['events'],
+            #                                 ax=axs[i, ax_number:ax_number+number_of_events])
 
-            axs[0].set_xticklabels(np.arange(0, num_epochs+1, 50))
-            axs[1].set_xticklabels(np.arange(0, num_epochs+1, 50))
-            
-            axs[1].set_xlabel('Epoch')
-            axs[0].set_ylabel('Loss')
-            axs[0].set_title(f'Loss for {model_name}')
-            axs[0].legend()
-            axs[1].legend()
-            axs[0].grid(True)
-            axs[1].grid(True)
-            fig.savefig(os.path.join(OUTPUT_DIRECTORY, f'loss_{model_name}.jpeg'))
-            plt.close()
+            # print(f'Finished plotting for Channel: {channel_name} ({i+1}/{len(channel_labels)})')
 
-        # Perform inference on ordered train
-        nirs_train_tensor = nirs_windowed_train_ordered.reshape(-1, len(nirs_channel_index)*nirs_token_size)
-        nirs_train_tensor = torch.from_numpy(nirs_train_tensor).float()
-        eeg_train_tensor = torch.from_numpy(eeg_windowed_train_ordered).float()
+        # Reduce figure size if it's too large
+        fig_size_inches = fig.get_size_inches()
+        max_size_inches = (100, 100)  # Adjust these values as needed
+        if fig_size_inches[0] > max_size_inches[0] or fig_size_inches[1] > max_size_inches[1]:
+            scale_factor = min(max_size_inches[0] / fig_size_inches[0], 
+                               max_size_inches[1] / fig_size_inches[1])
+            new_size = (fig_size_inches[0] * scale_factor, fig_size_inches[1] * scale_factor)
+            fig.set_size_inches(new_size)
 
-        # Assuming fnirs_test and eeg_test are your test datasets
-        train_dataset = EEGfNIRSData(nirs_train_tensor, eeg_train_tensor)
-        train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
+        plt.tight_layout()
+        # fig.savefig(os.path.join(visualization_config['output_path'], f'combined_evaluation_{highest_correlation:.4f}_{model_name}_{weight_epoch}.pdf'), dpi=300, bbox_inches='tight')
+        # plt.close()
+        # Save as PNG with compression
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        buf.seek(0)
+
+        # Open the image and further compress it
+        img = Image.open(buf)
+        img = img.convert('RGB')  # Convert to RGB to ensure compatibility        
         
-        # Get weights for specific epoch
-        weight_epochs = [100, 250, 500, 1000]
-        for weight_epoch in weight_epochs:
-            model_path = f'{model_name}_{weight_epoch}.pth'
-            model.load_state_dict(torch.load(os.path.join(MODEL_WEIGHTS, model_path)))
-            model.to(DEVICE)
-            model.eval()
-
-            target_train, predictions_train = predict_eeg(model, 
-                                            train_loader, 
-                                            n_samples=eeg_windowed_train_ordered.shape[0], 
-                                            n_channels=eeg_windowed_train_ordered.shape[2], 
-                                            n_lookback=eeg_windowed_train_ordered.shape[1],
-                                            eeg_token_size=eeg_token_size,
-                                            eeg_fpcas=eeg_fpcas)
-            targets, predictions = predict_eeg(model, 
-                                            test_loader, 
-                                            n_samples=eeg_windowed_test.shape[0], 
-                                            n_channels=eeg_windowed_test.shape[2], 
-                                            n_lookback=eeg_windowed_test.shape[1],
-                                            eeg_token_size=eeg_token_size,
-                                            eeg_fpcas=eeg_fpcas)
-            
-            print(f'Weight Epoch: {weight_epoch}')
-            print(f'Predictions Shape: {predictions.shape}')
-            print(f'Targets Shape: {targets.shape}')
+        output_filename = os.path.join(visualization_config['output_path'], 
+                                       f'combined_eval_{highest_correlation:.4f}_{model_name}_{weight_epoch}.webp')
         
-            # scipy.io.savemat(os.path.join(OUTPUT_DIRECTORY, f'test_{model_name}_{weight_epoch}.mat'), {'X': targets, 
-            #                                                         'XPred':predictions,
-            #                                                     'bins':10,
-            #                                                     'scale':10,
-            #                                       F              'srate':200})
-            
-            offset = 0  # Assuming no offset
-            timeSigma = 100  # Assuming a given timeSigma
-            num_bins = 50  # Assuming a given number of bins
+        img.save(output_filename, 'WEBP', quality=85, method=6)
+        
+        plt.close()
+        buf.close()
 
-            # Plotting target vs. output on concatenated data subplots for each channel
-            highest_r2 = 0
-            counter = 0
-            fig, axs = plt.subplots(len(eeg_channels_to_use), 2, figsize=(18, 100))
-            for i in range(len(eeg_channels_to_use)):
-                for j in range(2):
-                    if j == 0:
-                        type_label = 'Train'
-                        do_legend = True
-                        do_colorbar = False
-                        targets_single = target_train[:,:,counter]
-                        predictions_single = predictions_train[:,:,counter]
-
-                        target_average = np.mean(targets_single, axis=0)
-                        prediction_average = np.mean(predictions_single, axis=0)
-                        r2 = r2_score(target_average, prediction_average)
-                        
-                        channel_label = list(EEG_COORDS.keys())[counter]
-                    else:
-                        type_label = 'Test'
-                        do_legend = False
-                        do_colorbar = True
-                        targets_single = targets[:,:,counter]
-                        predictions_single = predictions[:,:,counter]
-
-                        target_average = np.mean(targets_single, axis=0)
-                        prediction_average = np.mean(predictions_single, axis=0)
-                        r2 = r2_score(target_average, prediction_average)
-                        if r2 > highest_r2:
-                            highest_r2 = r2
-
-                        channel_label = list(EEG_COORDS.keys())[counter]
-                        counter += 1
-
-                    # reshape to 1xn
-                    targets_single = targets_single.reshape(1, -1)
-                    predictions_single = predictions_single.reshape(1, -1)
-
-                    chan_labels = [channel_label]  # Assuming label as provided in the command
-                    test_fig = rolling_correlation(targets_single, 
-                                                predictions_single, 
-                                                chan_labels, 
-                                                offset=offset,
-                                                sampling_frequency=eeg_lookback,
-                                                timeSigma=timeSigma, 
-                                                num_bins=num_bins, 
-                                                zoom_start=0, 
-                                                #    zoom_end=500, 
-                                                do_legend=do_legend,
-                                                do_colorbar=do_colorbar,
-                                                ax=axs[i, j], 
-                                                title='')
-                            
-                    axs[i, j].text(0.5, 0.9, f'{eeg_channels_to_use[i]} {type_label} R-squared: {r2:.4f}', horizontalalignment='center', verticalalignment='center', transform=axs[i, j].transAxes)
-            fig.savefig(os.path.join(OUTPUT_DIRECTORY, f'test_{highest_r2:.4f}_{model_name}_{weight_epoch}.jpeg'))
-            plt.close()
+        if visualization_config['do_wandb']:
+            # Log final metrics to wandb
+            wandb.log({
+                "final_test_correlation": highest_correlation,
+                "weight_epoch": weight_epoch
+            })
 
 def main():
+    set_seed(42)  # You can choose any integer as your seed
+
+    # Make a new timestamp folder at OUTPUT_DIRECTORY for this run
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    base_output_directory = os.path.join(OUTPUT_DIRECTORY, timestamp)
+    os.makedirs(base_output_directory, exist_ok=True)
+
     # Define channels to use
-    nirs_channels_to_use_base = list(NIRS_COORDS.keys())
-    nirs_channel_index = find_indices(list(NIRS_COORDS.keys()),nirs_channels_to_use_base)
+    input_channel_names = list(NIRS_COORDS.keys())
+    target_channel_names = list(EEG_COORDS.keys())[:5]
 
-    eeg_channels_to_use = EEG_CHANNEL_NAMES
-    eeg_channel_index = find_indices(EEG_CHANNEL_NAMES,eeg_channels_to_use)
+    
+    # input_channel_names = list(EEG_COORDS.keys())
+    # input_channel_names.remove('Cz')
+    # target_channel_names = ['Cz']
 
-    for subject_id_int in subject_ids[8:]:
-        for model_name_base in ['rnn', 'mlp']:
-            run_model(subject_id_int, 
-                    model_name_base, 
-                    nirs_channels_to_use_base, 
-                    eeg_channels_to_use, 
-                    eeg_channel_index, 
-                    nirs_channel_index, 
-                    num_epochs, 
-                    redo_train=False)
-            gc.collect()
-            torch.cuda.empty_cache()
+    # Configuration
+    data_config = {
+        'tasks': ['task_name'],
+        'input_channel_names': input_channel_names,
+        'target_channel_names': target_channel_names,
+        'target_sample_rate': 200,
+        'input_t_min': -5,
+        'input_t_max': 10,
+        'target_t_min': 0,
+        'target_t_max': 1,
+        'tokenization': 'fpca',  # or 'raw'
+        'redo_tokenization': False,
+        'get_data_function': 'get_data_nirs_eeg', #'get_data_eeg_to_eeg', #get_data_nirs_eeg
+        'input_parameters': 'cbci', # 'hbo', 'hbr', 'cbci' Only works for get_data_nirs_eeg
+    }
+
+    visualization_config = {
+        'do_wandb': False,
+        'do_plot': True,
+        'do_save': True,
+        'weight_epochs': [500],
+        'channel_names': target_channel_names,  # Channels to visualize
+        'events': ['2-back non-target', '2-back target', '3-back non-target', '3-back target'],
+        'output_path': base_output_directory
+    }
+
+    model_configs = [
+        {
+        'name': 'rnn',
+        'hidden_dim': 64,
+        'spatial_encoding': True,
+        'num_lstm_layers': 1,
+        'bidirectional': False,
+        'dropout': 0,
+            'use_attention': False,
+        },
+    ]
+
+    training_configs = [
+        {
+            'do_train': True,
+            'do_load': False,
+            'redo_train': True,
+            'num_epochs': 500,
+            'num_train_windows': 1000,
+            'test_size': 0.15,
+            'validation_size': 0.05,
+            'learning_rate': 0.001,
+        }
+    ]
+
+    token_sizes = [
+        {
+            'input_token_size': 20,
+            'target_token_size': 30,
+        },
+    ]
+
+    
+    # from config.training_dictionaries import training_configs, token_sizes, rnn_model_configs, mlp_model_configs
+
+    run_number = 1
+    subject_ids = [4]  # Update as needed
+    for subject_id in subject_ids:
+        for token_size in token_sizes:
+            redo_tokenization = True
+            for model_config in model_configs:
+                for training_config in training_configs:
+                    model_name = f'{model_config["name"]}_{subject_id:02d}_n_chs_{len(data_config["input_channel_names"])}_{len(data_config["target_channel_names"])}_{run_number}'
+                    # Timestamp for loop
+                    output_directory = os.path.join(base_output_directory, model_name)
+                    os.makedirs(output_directory, exist_ok=True)
+
+                    print(f"Running model for subject {subject_id} with config:")
+                    print(f"Model config: {model_config}")
+                    print(f"Training config: {training_config}")
+                    print(f"Token size: {token_size}")
+
+                    data_config = data_config | token_size | {'redo_tokenization': redo_tokenization}
+                    visualization_config['output_path'] = output_directory
+                    save_config(subject_id, model_config, data_config, training_config, visualization_config)
+                    
+                    run_model(subject_id, model_name, model_config, data_config, training_config, visualization_config)
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                    run_number += 1
 
 if __name__ == '__main__':
-    ## Subject/Trial Parameters ##
-    subject_ids = np.arange(1,27) # 1-27
-    subjects = []
-    for i in subject_ids:
-        subjects.append(f'VP{i:03d}')
-
-    tasks = ['nback']
-    hemoglobin_types = ['hbo', 'hbr']
-
-    # NIRS Sampling rate
-    fnirs_sample_rate = 10.41
-    # EEG Downsampling rate
-    eeg_sample_rate = 200
-    # Time window (seconds)
-    eeg_t_min = 0
-    eeg_t_max = 1
-    nirs_t_min = -10
-    nirs_t_max = 10
-    offset_t = 0
-
-    # Redo preprocessing pickle files, TAKES A LONG TIME 
-    redo_preprocessing = False
-    do_load = False
-    do_train = True
-
-    # data projection
-    nirs_token_size = 10
-    eeg_token_size = 5
-    fnirs_lookback = 4000
-    eeg_lookback = 200
-
-    # training loop
-    num_epochs = 1000
-    test_size_in_subject = 0.2 # percent of test data
-
     main()
-
