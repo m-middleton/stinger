@@ -7,11 +7,16 @@ from scipy.stats import linregress
 import os
 
 import mne
+import mne_nirs
 from scipy.io import loadmat
 import pickle
 
 from processing.Processing_EEG import process_eeg_raw
 from processing.Processing_NIRS import process_nirs_raw
+from processing.Format_Data import find_indices
+
+from config.Constants import *
+
 
 def read_matlab_file(subject_id, base_path):
     '''Read matlab file and return data'''
@@ -357,3 +362,272 @@ def read_subjects_data(
     print(f'\nnirs events: {events.shape}')
 
     return eeg_processed_voltage, nirs_processed_hemoglobin
+
+def get_data_nirs_eeg(subject_id_int, data_config, training_config):
+
+    # Read and preprocess data
+    eeg_raw_mne, nirs_raw_mne = read_subjects_data(
+        subjects=[f'VP{subject_id_int:03d}'],
+        raw_data_directory=RAW_DIRECTORY,
+        tasks=data_config['tasks'],
+        eeg_event_translations=EEG_EVENT_TRANSLATIONS,
+        nirs_event_translations=NIRS_EVENT_TRANSLATIONS,
+        eeg_coords=EEG_COORDS,
+        tasks_stimulous_to_crop=TASK_STIMULOUS_TO_CROP,
+        trial_to_check_nirs=TRIAL_TO_CHECK_NIRS,
+        eeg_t_min=data_config['target_t_min'],
+        eeg_t_max=data_config['target_t_max'],
+        nirs_t_min=data_config['input_t_min'],
+        nirs_t_max=data_config['input_t_max'],
+        eeg_sample_rate=data_config['target_sample_rate'],
+        redo_preprocessing=False,
+    )
+
+    fnirs_sample_rate = nirs_raw_mne.info['sfreq']
+    eeg_sample_rate = eeg_raw_mne.info['sfreq']
+
+    #remove HEOG and VEOG
+    eeg_raw_mne.drop_channels(['HEOG', 'VEOG'])
+
+    if data_config['input_parameters'] == 'hbo':
+        # get only hbo
+        nirs_raw_mne.pick(picks='hbo')
+    elif data_config['input_parameters'] == 'hbr':
+        # get only hbr
+        nirs_raw_mne.pick(picks='hbr')
+    elif data_config['input_parameters'] == 'cbci':
+        # Apply CBCI to combine hbo and hbr along anticorrelation
+        nirs_raw_mne = mne_nirs.signal_enhancement.enhance_negative_correlation(nirs_raw_mne)
+    else:
+        raise ValueError(f"Invalid input_parameters value: {data_config['input_parameters']}")
+
+    input_channel_index = find_indices(list(NIRS_COORDS.keys()), data_config['input_channel_names']) # have to use coords dict because names get changed to source-detector pairs. Have verified order.
+    target_channel_index = find_indices(eeg_raw_mne.ch_names, data_config['target_channel_names'])
+
+    mrk_data, single_events_dict = mne.events_from_annotations(eeg_raw_mne)
+    mrk_data[:,0] -= mrk_data[0,0]
+    mrk_data[:,0] += int(eeg_sample_rate)
+    
+    eeg_data = eeg_raw_mne.get_data()
+    nirs_data = nirs_raw_mne.get_data()
+    print(f'EEG Shape: {eeg_data.shape}') # n_channels x n_samples_eeg
+    print(f'NIRS Shape: {nirs_data.shape}') # n_channels x n_samples_nirs
+    print(f'MRK Shape: {mrk_data.shape}') # n_events x 3 (timestamp, event_type, event_id)
+
+    # get channels
+    eeg_data = eeg_data[target_channel_index]
+    nirs_data = nirs_data[input_channel_index]
+
+    # split train and test on eeg_data, nirs_data, and mrk_data
+    eeg_test_size = int(eeg_data.shape[1]*training_config['test_size'])
+    eeg_validation_size = int(eeg_data.shape[1]*training_config['validation_size'])
+    eeg_train_size = eeg_data.shape[1] - eeg_test_size - eeg_validation_size
+
+    nirs_test_size = int(nirs_data.shape[1]*training_config['test_size'])
+    nirs_validation_size = int(nirs_data.shape[1]*training_config['validation_size'])
+    nirs_train_size = nirs_data.shape[1] - nirs_test_size - nirs_validation_size
+
+    train_eeg_data = eeg_data[:, :eeg_train_size]
+    validation_eeg_data = eeg_data[:, eeg_train_size:eeg_train_size+eeg_validation_size]
+    train_nirs_data = nirs_data[:, :nirs_train_size]
+    validation_nirs_data = nirs_data[:, nirs_train_size:nirs_train_size+nirs_validation_size]
+
+    test_eeg_data = eeg_data[:, eeg_train_size+eeg_validation_size:]
+    test_nirs_data = nirs_data[:, nirs_train_size+nirs_validation_size:]
+
+    # # normalize data
+    train_eeg_data = (train_eeg_data - np.mean(train_eeg_data)) / np.std(train_eeg_data)
+    validation_eeg_data = (validation_eeg_data - np.mean(validation_eeg_data)) / np.std(validation_eeg_data)
+    test_eeg_data = (test_eeg_data - np.mean(test_eeg_data)) / np.std(test_eeg_data)
+    train_nirs_data = (train_nirs_data - np.mean(train_nirs_data)) / np.std(train_nirs_data)
+    validation_nirs_data = (validation_nirs_data - np.mean(validation_nirs_data)) / np.std(validation_nirs_data)
+    test_nirs_data = (test_nirs_data - np.mean(test_nirs_data)) / np.std(test_nirs_data)
+
+    print(f'Train EEG Shape: {train_eeg_data.shape}')
+    print(f'Train NIRS Shape: {train_nirs_data.shape}')
+    print(f'Validation EEG Shape: {validation_eeg_data.shape}')
+    print(f'Validation NIRS Shape: {validation_nirs_data.shape}')
+    print(f'Test EEG Shape: {test_eeg_data.shape}')
+    print(f'Test NIRS Shape: {test_nirs_data.shape}')
+
+    # Calculate train and test mrk_data
+    train_max_event_timestamp = train_eeg_data.shape[1]
+    validation_max_event_timestamp = validation_eeg_data.shape[1] + train_max_event_timestamp
+    # MRK (timestamp, event_type, event_id)
+    train_mrk_data = np.array([event for event in mrk_data if event[0] < train_max_event_timestamp])
+    validation_mrk_data = np.array([event for event in mrk_data if event[0] >= train_max_event_timestamp and event[0] < validation_max_event_timestamp])
+    test_mrk_data = np.array([event for event in mrk_data if event[0] >= validation_max_event_timestamp])
+    # subtract train_max_event_timestamp from all index values in test_mrk_data
+    validation_mrk_data[:,0] -= train_max_event_timestamp
+    test_mrk_data[:,0] -= validation_max_event_timestamp
+
+    print(train_mrk_data[:5])
+    print(f'Train EEG Shape: {train_eeg_data.shape}')
+    print(f'Train NIRS Shape: {train_nirs_data.shape}')
+    print(f'Train MRK Shape: {train_mrk_data.shape}')
+    print(f'Validation EEG Shape: {validation_eeg_data.shape}')
+    print(f'Validation NIRS Shape: {validation_nirs_data.shape}')
+    print(f'Validation MRK Shape: {validation_mrk_data.shape}')
+    print(f'Test EEG Shape: {test_eeg_data.shape}')
+    print(f'Test NIRS Shape: {test_nirs_data.shape}')
+    print(f'Test MRK Shape: {test_mrk_data.shape}')
+
+    # print counts of unique markers in train_mrk_data and test_mrk_data
+    reverse_single_events_dict = {v: k for k, v in single_events_dict.items()}
+    print("Train MRK Counts:")
+    train_unique, train_counts = np.unique(train_mrk_data[:, 2], return_counts=True)
+    for marker, count in zip(train_unique, train_counts):
+        print(f"  Marker {reverse_single_events_dict[marker]}: {count}")
+
+    print("\nValidation MRK Counts:")
+    validation_unique, validation_counts = np.unique(validation_mrk_data[:, 2], return_counts=True)
+    for marker, count in zip(validation_unique, validation_counts):
+        print(f"  Marker {reverse_single_events_dict[marker]}: {count}")
+
+    print("\nTest MRK Counts:")
+    test_unique, test_counts = np.unique(test_mrk_data[:, 2], return_counts=True)
+    for marker, count in zip(test_unique, test_counts):
+        print(f"  Marker {reverse_single_events_dict[marker]}: {count}")
+
+    # channel_names = ['Cz', 'Pz']  # Add more channel names as needed
+    # event_selection = ['2-back non-target', '2-back target']
+    # plot_erp_by_channel(train_eeg_data, train_mrk_data, single_events_dict, channel_names, event_selection)
+
+    # grab coordinates at indexes
+    eeg_coordinates = np.array(list(EEG_COORDS.values()))[target_channel_index]
+    nirs_coordinates = np.array(list(NIRS_COORDS.values()))[input_channel_index]
+
+    data_dict = {
+        'train_target_signal': train_eeg_data,
+        'train_input_signal': train_nirs_data,
+        'test_target_signal': test_eeg_data,
+        'test_input_signal': test_nirs_data,
+        'train_mrk_data': train_mrk_data,
+        'test_mrk_data': test_mrk_data,
+        'validation_target_signal': validation_eeg_data,
+        'validation_input_signal': validation_nirs_data,
+        'validation_mrk_data': validation_mrk_data,
+
+        'target_coordinates': eeg_coordinates,
+        'input_coordinates': nirs_coordinates,
+        'input_channel_index': input_channel_index,
+        'target_channel_index': target_channel_index
+    }
+
+    return data_dict, fnirs_sample_rate, eeg_sample_rate, single_events_dict
+
+def get_data_eeg_to_eeg(subject_id_int, data_config, training_config, target_channel='Cz'):
+    # Read and preprocess data
+    eeg_raw_mne, _ = read_subjects_data(
+        subjects=[f'VP{subject_id_int:03d}'],
+        raw_data_directory=RAW_DIRECTORY,
+        tasks=data_config['tasks'],
+        eeg_event_translations=EEG_EVENT_TRANSLATIONS,
+        nirs_event_translations=NIRS_EVENT_TRANSLATIONS,
+        eeg_coords=EEG_COORDS,
+        tasks_stimulous_to_crop=TASK_STIMULOUS_TO_CROP,
+        trial_to_check_nirs=TRIAL_TO_CHECK_NIRS,
+        eeg_t_min=data_config['target_t_min'],
+        eeg_t_max=data_config['target_t_max'],
+        nirs_t_min=data_config['input_t_min'],
+        nirs_t_max=data_config['input_t_max'],
+        eeg_sample_rate=data_config['target_sample_rate'],
+        redo_preprocessing=False,
+    )
+
+    eeg_sample_rate = eeg_raw_mne.info['sfreq']
+
+    # Remove HEOG and VEOG
+    eeg_raw_mne.drop_channels(['HEOG', 'VEOG'])
+
+    mrk_data, single_events_dict = mne.events_from_annotations(eeg_raw_mne)
+    mrk_data[:,0] -= mrk_data[0,0]
+    mrk_data[:,0] += int(eeg_sample_rate)
+    
+    eeg_data = eeg_raw_mne.get_data()
+    print(f'EEG Shape: {eeg_data.shape}') # n_channels x n_samples_eeg
+    print(f'MRK Shape: {mrk_data.shape}') # n_events x 3 (timestamp, event_type, event_id)
+
+    # Get target channel index
+    target_channel_index = eeg_raw_mne.ch_names.index(target_channel)
+    
+    # Split data into target and input
+    target_eeg_data = eeg_data[target_channel_index:target_channel_index+1]
+    input_eeg_data = np.delete(eeg_data, target_channel_index, axis=0)
+
+    # Split train, validation, and test data
+    data_size = eeg_data.shape[1]
+    test_size = int(data_size * training_config['test_size'])
+    validation_size = int(data_size * training_config['validation_size'])
+    train_size = data_size - test_size - validation_size
+
+    train_target_data = target_eeg_data[:, :train_size]
+    train_input_data = input_eeg_data[:, :train_size]
+    
+    validation_target_data = target_eeg_data[:, train_size:train_size+validation_size]
+    validation_input_data = input_eeg_data[:, train_size:train_size+validation_size]
+    
+    test_target_data = target_eeg_data[:, train_size+validation_size:]
+    test_input_data = input_eeg_data[:, train_size+validation_size:]
+
+    # Normalize data
+    train_target_data = (train_target_data - np.mean(train_target_data)) / np.std(train_target_data)
+    validation_target_data = (validation_target_data - np.mean(validation_target_data)) / np.std(validation_target_data)
+    test_target_data = (test_target_data - np.mean(test_target_data)) / np.std(test_target_data)
+    
+    train_input_data = (train_input_data - np.mean(train_input_data, axis=1, keepdims=True)) / np.std(train_input_data, axis=1, keepdims=True)
+    validation_input_data = (validation_input_data - np.mean(validation_input_data, axis=1, keepdims=True)) / np.std(validation_input_data, axis=1, keepdims=True)
+    test_input_data = (test_input_data - np.mean(test_input_data, axis=1, keepdims=True)) / np.std(test_input_data, axis=1, keepdims=True)
+
+    print(f'Train Target EEG Shape: {train_target_data.shape}')
+    print(f'Train Input EEG Shape: {train_input_data.shape}')
+    print(f'Validation Target EEG Shape: {validation_target_data.shape}')
+    print(f'Validation Input EEG Shape: {validation_input_data.shape}')
+    print(f'Test Target EEG Shape: {test_target_data.shape}')
+    print(f'Test Input EEG Shape: {test_input_data.shape}')
+
+    # Calculate train, validation, and test mrk_data
+    train_max_event_timestamp = train_size
+    validation_max_event_timestamp = train_size + validation_size
+    
+    train_mrk_data = np.array([event for event in mrk_data if event[0] < train_max_event_timestamp])
+    validation_mrk_data = np.array([event for event in mrk_data if train_max_event_timestamp <= event[0] < validation_max_event_timestamp])
+    test_mrk_data = np.array([event for event in mrk_data if event[0] >= validation_max_event_timestamp])
+    
+    validation_mrk_data[:,0] -= train_max_event_timestamp
+    test_mrk_data[:,0] -= validation_max_event_timestamp
+
+    print(f'Train MRK Shape: {train_mrk_data.shape}')
+    print(f'Validation MRK Shape: {validation_mrk_data.shape}')
+    print(f'Test MRK Shape: {test_mrk_data.shape}')
+
+    # Print counts of unique markers
+    reverse_single_events_dict = {v: k for k, v in single_events_dict.items()}
+    for data_type, mrk_data in [("Train", train_mrk_data), ("Validation", validation_mrk_data), ("Test", test_mrk_data)]:
+        print(f"\n{data_type} MRK Counts:")
+        unique, counts = np.unique(mrk_data[:, 2], return_counts=True)
+        for marker, count in zip(unique, counts):
+            print(f"  Marker {reverse_single_events_dict[marker]}: {count}")
+
+    # Get coordinates
+    eeg_coordinates = np.array(list(EEG_COORDS.values()))
+    target_coordinates = eeg_coordinates[target_channel_index:target_channel_index+1]
+    input_coordinates = np.delete(eeg_coordinates, target_channel_index, axis=0)
+
+    data_dict = {
+        'train_target_signal': train_target_data,
+        'train_input_signal': train_input_data,
+        'test_target_signal': test_target_data,
+        'test_input_signal': test_input_data,
+        'train_mrk_data': train_mrk_data,
+        'test_mrk_data': test_mrk_data,
+        'validation_target_signal': validation_target_data,
+        'validation_input_signal': validation_input_data,
+        'validation_mrk_data': validation_mrk_data,
+        'target_coordinates': target_coordinates,
+        'input_coordinates': input_coordinates,
+        'input_channel_index': np.arange(len(eeg_raw_mne.ch_names) - 1),  # All channels except the target
+        'target_channel_index': np.array([target_channel_index])
+    }
+
+    return data_dict, eeg_sample_rate, eeg_sample_rate, single_events_dict

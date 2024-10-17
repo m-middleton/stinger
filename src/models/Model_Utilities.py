@@ -3,18 +3,11 @@
 '''
 
 import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from iTransformer.iTransformer.iTransformerTranscoding import iTransformer
-
-import torch
-import torch.nn as nn
-
-import torch
-import torch.nn as nn
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, num_channels):
@@ -28,65 +21,121 @@ class PositionalEncoding(nn.Module):
 
 class EnhancedLSTMModel(nn.Module):
     def __init__(self, input_features, 
-                 output_features, 
-                 num_nirs_channels, 
-                 num_eeg_channels, 
-                 hidden_dim, 
-                 nirs_seq_len, 
-                 eeg_seq_len, 
-                 eeg_position_hidden_dimension=2):
+                output_features, 
+                num_input_channels, 
+                num_target_channels, 
+                hidden_dim, 
+                input_seq_len, 
+                target_seq_len, 
+                target_position_hidden_dimension=2,
+                spatial_encoding=True,
+                num_lstm_layers=1,
+                bidirectional=False,
+                dropout=0,
+                use_attention=False,
+                attention_heads=1):
         super(EnhancedLSTMModel, self).__init__()
-        self.nirs_positional_encoding = PositionalEncoding(input_features // num_nirs_channels, num_nirs_channels)
-        self.eeg_positional_encoding = PositionalEncoding(eeg_position_hidden_dimension, num_eeg_channels)
-        self.lstm = nn.LSTM(input_size=input_features, hidden_size=hidden_dim, batch_first=True)
-        self.linear = nn.Linear(hidden_dim + eeg_position_hidden_dimension * num_eeg_channels, output_features)
-        self.num_nirs_channels = num_nirs_channels
-        self.num_eeg_channels = num_eeg_channels
-        self.nirs_seq_len = nirs_seq_len
-        self.eeg_seq_len = eeg_seq_len
+        
+        self.num_input_channels = num_input_channels
+        self.num_target_channels = num_target_channels
+        self.input_seq_len = input_seq_len
+        self.target_seq_len = target_seq_len
         self.hidden_dim = hidden_dim
+        
+        self.spatial_encoding = spatial_encoding
+        self.use_attention = use_attention
+
+        if self.spatial_encoding:
+            self.input_positional_encoding = PositionalEncoding(input_features // num_input_channels, num_input_channels)
+            self.target_positional_encoding = PositionalEncoding(target_position_hidden_dimension, num_target_channels)
+        
+        lstm_output_dim = hidden_dim * 2 if bidirectional else hidden_dim
+        self.lstm = nn.LSTM(input_size=input_features, 
+                            hidden_size=hidden_dim, 
+                            num_layers=num_lstm_layers,
+                            batch_first=True,
+                            bidirectional=bidirectional,
+                            dropout=dropout if num_lstm_layers > 1 else 0)
+        
+        if self.use_attention:
+            self.attention = nn.MultiheadAttention(lstm_output_dim, attention_heads)
+        
+        if self.spatial_encoding:
+            final_dim = lstm_output_dim + target_position_hidden_dimension * num_target_channels
+        else:
+            final_dim = lstm_output_dim
+        
+        self.linear = nn.Linear(final_dim, output_features)
     
-    def forward(self, x, nirs_coordinates, eeg_coordinates):
-        # x shape: (batch_size, seq_len, num_nirs_channels * feature_dim)
-        # nirs_coordinates shape: (num_nirs_channels, 3)
-        # eeg_coordinates shape: (num_eeg_channels, 3)
+    def forward(self, x, input_coordinates, target_coordinates):
+        # x shape: (batch_size, seq_len, num_input_channels * feature_dim)
+        # input_coordinates shape: (num_input_channels, 3)
+        # target_coordinates shape: (num_target_channels, 3)
+
         batch_size, seq_len, _ = x.shape
         
-        # Add NIRS positional encoding
-        nirs_pos_encoding = self.nirs_positional_encoding(nirs_coordinates)
-        nirs_pos_encoding = nirs_pos_encoding.unsqueeze(0).expand(batch_size, -1, -1)
-        nirs_pos_encoding = nirs_pos_encoding.reshape(batch_size, self.nirs_seq_len, self.num_nirs_channels)
+        # Add input positional encoding
+        if self.spatial_encoding:
+            input_pos_encoding = self.input_positional_encoding(input_coordinates)
+            input_pos_encoding = input_pos_encoding.unsqueeze(0).expand(batch_size, -1, -1)
+            input_pos_encoding = input_pos_encoding.reshape(batch_size, self.input_seq_len, self.num_input_channels)
 
-        x_with_pos = x + nirs_pos_encoding
+            lstm_input = x + input_pos_encoding
+        else:
+            lstm_input = x
 
         # flatten the input
-        x_with_pos = x_with_pos.reshape(batch_size, -1)
-        
+        lstm_input = lstm_input.reshape(batch_size, -1)
+
         # Process with LSTM
-        lstm_out, _ = self.lstm(x_with_pos)
+        lstm_out, _ = self.lstm(lstm_input)
         
-        # Add EEG positional encoding
-        eeg_pos_encoding = self.eeg_positional_encoding(eeg_coordinates)
-        eeg_pos_encoding = eeg_pos_encoding.unsqueeze(0).expand(batch_size, -1, -1)
+        if self.use_attention:
+            lstm_out, _ = self.attention(lstm_out, lstm_out, lstm_out)
         
-        # Combine LSTM output with EEG positional encoding
-        lstm_out = lstm_out.view(batch_size, self.hidden_dim)
-        eeg_pos_encoding = eeg_pos_encoding.view(batch_size, -1)
-        combined = torch.cat([lstm_out, eeg_pos_encoding], dim=-1)
+        if self.spatial_encoding:
+            # Add target positional encoding
+            target_pos_encoding = self.target_positional_encoding(target_coordinates)
+            target_pos_encoding = target_pos_encoding.unsqueeze(0).expand(batch_size, -1, -1)
         
+            # Combine LSTM output with target positional encoding
+            lstm_out = lstm_out.view(batch_size, self.hidden_dim)
+            target_pos_encoding = target_pos_encoding.view(batch_size, -1)
+            lstm_out = torch.cat([lstm_out, target_pos_encoding], dim=-1)
+
         # Final prediction
-        y_pred = self.linear(combined)
+        y_pred = self.linear(lstm_out)
         return y_pred
 
 def create_rnn(n_input, 
                n_output,  
-               nirs_sequence_length,
-               eeg_sequence_length, 
-               num_nirs_channels, 
-               num_eeg_channels,
-               hidden_dim=64):
+               input_sequence_length,
+               target_sequence_length, 
+               num_input_channels, 
+               num_target_channels,
+               hidden_dim=64,
+               spatial_encoding=True,
+               num_lstm_layers=1,
+               bidirectional=False,
+               dropout=0,
+               use_attention=False,
+               attention_heads=1):
     print(f'Creating Enhanced RNN with input features: {n_input} and output features: {n_output}')
-    model = EnhancedLSTMModel(n_input, n_output, num_nirs_channels, num_eeg_channels, hidden_dim, nirs_sequence_length, eeg_sequence_length)
+    model = EnhancedLSTMModel(
+        input_features=n_input, 
+        output_features=n_output, 
+        num_input_channels=num_input_channels,
+        num_target_channels=num_target_channels, 
+        hidden_dim=hidden_dim, 
+        input_seq_len=input_sequence_length, 
+        target_seq_len=target_sequence_length,
+        spatial_encoding=spatial_encoding,
+        num_lstm_layers=num_lstm_layers,
+        bidirectional=bidirectional,
+        dropout=dropout,
+        use_attention=use_attention,
+        attention_heads=attention_heads
+    )
     return model
 
 class MLPModel(nn.Module):
@@ -109,16 +158,16 @@ class MLPModel(nn.Module):
         
         self.model = nn.Sequential(*layers)
     
-    def forward(self, x, nirs_coordinates, eeg_coordinates):
+    def forward(self, x, input_coordinates, target_coordinates):
         x = x.reshape(x.shape[0], -1)
         return self.model(x)
 
 def create_mlp(n_input, 
                n_output,
-               nirs_sequence_length,
-               eeg_sequence_length, 
-               num_nirs_channels, 
-               num_eeg_channels,
+               input_sequence_length,
+               target_sequence_length, 
+               num_input_channels, 
+               num_target_channels,
                hidden_dims=[512, 256, 128],
                dropout_rate=0.2,
                activation=nn.ReLU):
@@ -126,10 +175,10 @@ def create_mlp(n_input,
     Creates a Multi-Layer Perceptron (MLP) for transcoding.
     
     Args:
-        n_input (int): Number of input features (e.g., 360)
-        n_output (int): Number of output features (e.g., 150)
-        num_nirs_channels (int): Number of NIRS channels
-        num_eeg_channels (int): Number of EEG channels
+        n_input (int): Number of input features
+        n_output (int): Number of output features
+        num_input_channels (int): Number of input signal channels
+        num_target_channels (int): Number of target signal channels
         hidden_dims (list): List of hidden layer dimensions
         dropout_rate (float): Dropout rate for regularization
         activation (nn.Module): Activation function to use
@@ -143,12 +192,12 @@ def create_mlp(n_input,
 
     return model
 
-def create_transformer(nirs_channels_to_use_base, eeg_channels_to_use, fnirs_lookback, eeg_lookback):
+def create_transformer(input_channels_to_use, target_channels_to_use, input_lookback, target_lookback):
     model = iTransformer(
-            num_variates = len(nirs_channels_to_use_base),
-            lookback_len = fnirs_lookback,      # or the lookback length in the paper
-            target_num_variates=len(eeg_channels_to_use),
-            target_lookback_len=eeg_lookback,
+            num_variates = len(input_channels_to_use),
+            lookback_len = input_lookback,
+            target_num_variates=len(target_channels_to_use),
+            target_lookback_len=target_lookback,
             dim = 256,                          # model dimensions
             depth = 6,                          # depth
             heads = 8,                          # attention heads
@@ -157,13 +206,13 @@ def create_transformer(nirs_channels_to_use_base, eeg_channels_to_use, fnirs_loo
             ff_mult=4,
             ff_dropout=0.1,
             num_mem_tokens=10,
-            num_tokens_per_variate = 1,         # experimental setting that projects each variate to more than one token. the idea is that the network can learn to divide up into time tokens for more granular attention across time. thanks to flash attention, you should be able to accommodate long sequence lengths just fine
-            use_reversible_instance_norm = True # use reversible instance normalization, proposed here https://openreview.net/forum?id=cGDAkQo1C0p . may be redundant given the layernorms within iTransformer (and whatever else attention learns emergently on the first layer, prior to the first layernorm). if i come across some time, i'll gather up all the statistics across variates, project them, and condition the transformer a bit further. that makes more sense
+            num_tokens_per_variate = 1,         # Experimental setting
+            use_reversible_instance_norm = True # Use reversible instance normalization
         )
     
     return model
 
-def predict_eeg(model, data_loader, spatial_bias, nirs_coordinates, eeg_coordinates, n_samples, n_channels, n_lookback, eeg_token_size, tokenizer):
+def predict_signal(model, data_loader, spatial_bias, input_coordinates, target_coordinates, n_samples, n_channels, n_lookback, target_token_size, tokenizer):
     # Set model to evaluation mode
     model.eval()
 
@@ -177,33 +226,22 @@ def predict_eeg(model, data_loader, spatial_bias, nirs_coordinates, eeg_coordina
             X_batch = X_batch.to(device).float()
             y_batch = y_batch.to(device).float()
             spatial_bias_batch = spatial_bias.to(device)
-            nirs_coordinates = nirs_coordinates.to(device)
-            eeg_coordinates = eeg_coordinates.to(device)
+            input_coordinates_batch = input_coordinates.to(device)
+            target_coordinates_batch = target_coordinates.to(device)
             
-            # prediction = model(X_batch, spatial_bias_batch)
-            prediction = model(X_batch, nirs_coordinates, eeg_coordinates)
+            prediction = model(X_batch, input_coordinates_batch, target_coordinates_batch)
 
             predictions.append(prediction.detach().cpu().numpy())
             targets.append(y_batch.detach().cpu().numpy())
     
     predictions = np.concatenate(predictions)
     targets = np.concatenate(targets)
-
-    # predictions = []
-    # targets = []
-    # for batch_idx, (X_batch, y_batch) in enumerate(data_loader):
-    #     X_batch = X_batch.to(device).float()
-    #     y_batch = y_batch.to(device).float()
-    #     predictions.append(model(X_batch).detach().cpu().numpy())
-    #     targets.append(y_batch.detach().cpu().numpy())
-
-    # predictions = np.array(predictions)
-    # targets = np.array(targets)
     
     targets = targets.reshape((n_samples, n_lookback, n_channels))
-    predictions = predictions.reshape(n_samples, eeg_token_size, n_channels)
+    predictions = predictions.reshape(n_samples, target_token_size, n_channels)
 
-    # inverse CA on predictions
-    predictions = tokenizer.inverse_tokenizer(predictions)
+    # Apply inverse tokenizer on predictions if applicable
+    if tokenizer is not None:
+        predictions = tokenizer.inverse_tokenize('target', predictions)
 
     return targets, predictions

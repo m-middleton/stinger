@@ -140,6 +140,9 @@ venv.bak/
 # mkdocs documentation
 /site
 
+# Wandb
+/wandb
+
 # mypy
 .mypy_cache/
 .dmypy.json

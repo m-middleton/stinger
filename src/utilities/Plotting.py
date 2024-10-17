@@ -9,8 +9,8 @@ import multiprocessing
 import numpy as np
 import pandas as pd
 import scipy.signal as signal
-from scipy.stats import pearsonr
 from sklearn.metrics import r2_score
+from scipy.stats import pearsonr, linregress
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 import tkinter as tk
@@ -420,50 +420,56 @@ def plot_scatter_between_timepoints(
     test_targets,
     test_predictions,
     channels_to_use,
+    ax=None
 ):
-    fig, axs = plt.subplots(len(channels_to_use), 2, figsize=(36, 5*len(channels_to_use)), squeeze=False)
-    
-    for i, channel in enumerate(channels_to_use):
-        # Determine the overall min and max for both train and test data
-        all_data = np.concatenate([
-            train_targets[:,i], train_predictions[:,i],
-            test_targets[:,i], test_predictions[:,i]
-        ])
-        vmin, vmax = np.min(all_data), np.max(all_data)
+    if ax is None:
+        fig, (ax_train, ax_test) = plt.subplots(1, 2, figsize=(20, 10))
+    else:
+        fig = ax[0].figure
+        ax_train, ax_test = ax
+
+    # Determine the overall min and max for both train and test data
+    all_data = np.concatenate([
+        train_targets, train_predictions,
+        test_targets, test_predictions
+    ])
+    vmin, vmax = np.min(all_data), np.max(all_data)
+
+    for targets, predictions, label, ax in [
+        (train_targets, train_predictions, 'Train', ax_train),
+        (test_targets, test_predictions, 'Test', ax_test)
+    ]:
+        real_data = targets.flatten()
+        predicted_data = predictions.flatten()
+
+        # Create a color map from dark blue to light blue
+        n_points = len(real_data)
+        colors = plt.cm.Blues(np.linspace(0.3, 1, n_points))
+
+        # Plot the scatter with color gradient
+        scatter = ax.scatter(real_data, predicted_data, c=range(n_points), 
+                             cmap='Blues', alpha=0.6, s=1, 
+                             vmin=0, vmax=n_points-1)
+
+        # Calculate and plot the best fit line
+        slope, intercept, r_value, p_value, std_err = linregress(real_data, predicted_data)
+        line = slope * np.array([vmin, vmax]) + intercept
+        ax.plot([vmin, vmax], line, 'g-', label=f'Best fit (R² = {r_value**2:.3f})')
+
+        ax.set_xlabel('Real')
+        ax.set_ylabel('Predicted')
+        ax.set_title(f'{label} Scatter Plot')
         
-        for j, (targets, predictions, title) in enumerate([
-            (train_targets, train_predictions, 'Train'),
-            (test_targets, test_predictions, 'Test')
-        ]):
-            real_data = targets[:,i]
-            predicted_data = predictions[:,i]
+        # Set the same limits for both axes
+        ax.set_xlim(vmin, vmax)
+        ax.set_ylim(vmin, vmax)
 
-            # Create a color map from dark blue to light blue
-            n_points = len(real_data)
-            colors = plt.cm.Blues(np.linspace(0.3, 1, n_points))
+        # Add identity line
+        ax.plot([vmin, vmax], [vmin, vmax], 'r--', alpha=0.5, label='Identity')
 
-            # Plot the scatter with color gradient
-            scatter = axs[i, j].scatter(real_data, predicted_data, c=range(n_points), 
-                                        cmap='Blues', alpha=0.6, s=0.5, 
-                                        vmin=0, vmax=n_points-1)
+        ax.legend()
 
-            axs[i, j].set_xlabel('Real')
-            axs[i, j].set_ylabel('Predicted')
-            axs[i, j].set_title(f'{channel} - {title}')
-            
-            # Set the same limits for both plots
-            axs[i, j].set_xlim(vmin, vmax)
-            axs[i, j].set_ylim(vmin, vmax)
-
-            # Add identity line
-            axs[i, j].plot([vmin, vmax], [vmin, vmax], 'r--', alpha=0.5)
-
-        # Add a single colorbar for both train and test plots
-        cbar = fig.colorbar(scatter, ax=axs[i, :], orientation='vertical', aspect=30)
-        cbar.set_label('Time progression')
-
-    plt.tight_layout()
-    return fig, axs
+    return fig, (ax_train, ax_test)
 
 def plot_erp_matrix(subject_ids,
                     tasks,
@@ -662,7 +668,6 @@ def plot_erp_by_channel(train_eeg_data,
 
     # Get unique markers for selected events
     unique_markers = [marker for marker, event in single_events_dict_reverse.items() if event in event_selection]
-    print("Unique markers:", unique_markers)
 
     # Create figure and subplots
     n_cols = len(channel_names)
@@ -686,7 +691,7 @@ def plot_erp_by_channel(train_eeg_data,
         avg_erp_list = []
         sem_erp_list = []
         for i, marker in enumerate(unique_markers):
-            print(f"Processing {single_events_dict_reverse[marker]} for {channel_name}")
+            print(f"Processing ERP {single_events_dict_reverse[marker]} for {channel_name}")
 
             # Find indices of the current marker
             marker_indices = np.where(train_mrk_data[:, 2] == marker)[0]
@@ -747,7 +752,8 @@ def compare_real_vs_predicted_erp(real_eeg_data,
                                   channel_names, 
                                   event_selection,
                                   time_window = [-0.1, 0.9],
-                                  sampling_rate = 200):
+                                  sampling_rate = 200,
+                                  ax=None):
     
     samples_window = [int(t * sampling_rate) for t in time_window]
 
@@ -757,108 +763,58 @@ def compare_real_vs_predicted_erp(real_eeg_data,
     # Get unique markers for selected events
     unique_markers = [marker for marker, event in single_events_dict_reverse.items() if event in event_selection]
 
-    # Create figure and subplots
-    n_cols = len(unique_markers)
-    n_rows = len(channel_names)
-    fig, axs = plt.subplots(n_rows, n_cols, figsize=(7*n_cols, 6*n_rows), sharey=True)
-    
-    if n_rows == 1:
-        axs = [axs]
-    if n_cols == 1:
-        axs = [[ax] for ax in axs]
+    # Create figure and axes if not provided
+    if ax is None:
+        fig, axs = plt.subplots(1, len(unique_markers), figsize=(20, 5))
+    else:
+        fig = ax[0].figure
+        axs = ax
 
     # Define colors for real, predicted, and difference
     colors = ['green', 'blue', 'purple']
 
-    # Calculate and plot ERP for each channel
-    for j, channel_name in enumerate(channel_names):
+    # Calculate and plot ERP for each marker
+    for i, marker in enumerate(unique_markers):
+        # Find indices of the current marker
+        marker_indices = np.where(mrk_data[:, 2] == marker)[0]
+        marker_indices = mrk_data[marker_indices][:,0] # Grab sample index
 
-        for i, marker in enumerate(unique_markers):
-            print(f"Processing {single_events_dict_reverse[marker]} for {channel_name}")
-
-            # Find indices of the current marker
-            marker_indices = np.where(mrk_data[:, 2] == marker)[0]
-            marker_indices = mrk_data[marker_indices][:,0] # Grab sample index
-
-            # Extract EEG data around each marker
-            real_epochs = []
-            predicted_epochs = []
-            for idx in marker_indices:
-                start = idx + samples_window[0]
-                end = idx + samples_window[1]
-                if start >= 0 and end < real_eeg_data.shape[1]:
-                    real_epochs.append(real_eeg_data[j, start:end])
-                    predicted_epochs.append(predicted_eeg_data[j, start:end])
-            
-            real_epochs = np.array(real_epochs)
-            predicted_epochs = np.array(predicted_epochs)
-            
-            # Calculate mean and SEM
-            real_mean = np.mean(real_epochs, axis=0)
-            real_sem = np.std(real_epochs, axis=0) / np.sqrt(real_epochs.shape[0])
-            pred_mean = np.mean(predicted_epochs, axis=0)
-            pred_sem = np.std(predicted_epochs, axis=0) / np.sqrt(predicted_epochs.shape[0])
-            diff_mean = real_mean - pred_mean
-            diff_sem = np.sqrt(real_sem**2 + pred_sem**2)  # Propagation of uncertainty
-            
-            # Plot mean and SEM
-            time = np.linspace(time_window[0], time_window[1], real_mean.shape[0])
-            axs[j][i].plot(time, real_mean, color=colors[0], label='Real')
-            axs[j][i].fill_between(time, real_mean - real_sem, real_mean + real_sem, color=colors[0], alpha=0.3)
-            axs[j][i].plot(time, pred_mean, color=colors[1], label='Predicted')
-            axs[j][i].fill_between(time, pred_mean - pred_sem, pred_mean + pred_sem, color=colors[1], alpha=0.3)
-            axs[j][i].plot(time, diff_mean, color=colors[2], label='Difference', alpha=0.5)
-            # axs[j][i].fill_between(time, diff_mean - diff_sem, diff_mean + diff_sem, color=colors[2], alpha=0.1)
-            
-            axs[j][i].set_title(f'{channel_name} - {single_events_dict_reverse[marker]}')
-            axs[j][i].set_xlabel('Time (s)')
-            axs[j][i].set_ylabel('Amplitude')
-            axs[j][i].axvline(x=0, color='k', linestyle='--')  # Add vertical line at t=0
-            if j == 0 and i == 0:
-                axs[j][i].legend()
+        # Extract EEG data around each marker
+        real_epochs = []
+        predicted_epochs = []
+        for idx in marker_indices:
+            start = idx + samples_window[0]
+            end = idx + samples_window[1]
+            if start >= 0 and end < real_eeg_data.shape[1]:
+                real_epochs.append(real_eeg_data[:, start:end])
+                predicted_epochs.append(predicted_eeg_data[:, start:end])
+        
+        real_epochs = np.array(real_epochs)
+        predicted_epochs = np.array(predicted_epochs)
+        
+        # Calculate mean and SEM
+        real_mean = np.mean(real_epochs, axis=0).squeeze()
+        real_sem = np.std(real_epochs, axis=0).squeeze() / np.sqrt(real_epochs.shape[0])
+        pred_mean = np.mean(predicted_epochs, axis=0).squeeze()
+        pred_sem = np.std(predicted_epochs, axis=0).squeeze() / np.sqrt(predicted_epochs.shape[0])
+        diff_mean = real_mean - pred_mean
+        diff_sem = np.sqrt(real_sem**2 + pred_sem**2)  # Propagation of uncertainty
+        
+        # Calculate correlation
+        correlation, _ = pearsonr(real_mean, pred_mean)
+        
+        # Plot mean and SEM
+        time = np.linspace(time_window[0], time_window[1], real_mean.shape[0])
+        axs[i].plot(time, real_mean, color=colors[0], label='Real')
+        axs[i].fill_between(time, real_mean - real_sem, real_mean + real_sem, color=colors[0], alpha=0.3)
+        axs[i].plot(time, pred_mean, color=colors[1], label='Predicted')
+        axs[i].fill_between(time, pred_mean - pred_sem, pred_mean + pred_sem, color=colors[1], alpha=0.3)
+        axs[i].plot(time, diff_mean, color=colors[2], label='Difference', alpha=0.5)
+        
+        axs[i].set_xlabel('Time (s)')
+        axs[i].set_ylabel('Amplitude')
+        axs[i].axvline(x=0, color='k', linestyle='--')  # Add vertical line at t=0
+        axs[i].set_title(f'Event: {single_events_dict_reverse[marker]}\nCorrelation: {correlation:.4f}')
+        axs[i].legend()
 
     return fig, axs
-
-def process_channel_rolling_correlation(i, channel_name, train_data, test_data, data_config, offset, timeSigma, num_bins, channel_labels):
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 5))
-    highest_r2 = 0
-
-    print(f'Processing Channel: {channel_name}')
-    
-    for j, (targets, predictions, type_label, do_legend, do_colorbar) in enumerate([train_data, test_data]):
-        targets_single = targets[:,:,i]
-        predictions_single = predictions[:,:,i]
-
-        target_average = np.mean(targets_single, axis=0)
-        prediction_average = np.mean(predictions_single, axis=0)
-        r2 = r2_score(target_average, prediction_average)
-
-        if j == 1 and r2 > highest_r2:
-            highest_r2 = r2
-
-        chan_labels = [channel_labels[i]]
-        ax = ax1 if j == 0 else ax2
-
-        # reshape to 1xn
-        targets_single = targets_single.reshape(1, -1)
-        predictions_single = predictions_single.reshape(1, -1)
-        
-        rolling_correlation(targets_single, 
-                            predictions_single, 
-                            chan_labels, 
-                            offset=offset,
-                            sampling_frequency=data_config['eeg_sample_rate'],
-                            timeSigma=timeSigma, 
-                            num_bins=num_bins, 
-                            zoom_start=0, 
-                            do_legend=do_legend,
-                            do_colorbar=do_colorbar,
-                            ax=ax, 
-                            title='')
-        
-        ax.text(0.5, 0.9, f'{channel_name} {type_label} R-squared: {r2:.4f}', 
-                horizontalalignment='center', verticalalignment='center', 
-                transform=ax.transAxes)
-
-    plt.tight_layout()
-    return fig, highest_r2

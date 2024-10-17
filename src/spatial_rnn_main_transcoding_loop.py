@@ -38,8 +38,8 @@ import gc
 from config.Constants import *
 
 from processing.Format_Data import grab_ordered_windows, grab_random_windows, find_indices, EEGfNIRSData
-from processing.FPCA import perform_fpca_over_channels, get_fpca_dict, plot_explained_variance_over_dict
-from processing.CCA import perform_cca_over_channels, get_cca_dict
+from tokenization.FPCA import perform_fpca_over_channels, get_fpca_dict, plot_explained_variance_over_dict
+from tokenization.CCA import perform_cca_over_channels, get_cca_dict
 
 from utilities.Read_Data import read_matlab_file, read_subjects_data
 from models.Model_Utilities import predict_eeg, create_rnn, create_mlp, create_transformer

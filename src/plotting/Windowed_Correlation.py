@@ -2,79 +2,49 @@
 This file contains the function to perform rolling correlation and plot the results
 '''
 
-import scipy.ndimage
-from scipy.spatial.distance import cdist
-
-from matplotlib.collections import LineCollection
-
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+import scipy.ndimage
+from scipy.spatial.distance import cdist
+from multiprocessing import Pool, cpu_count
 
-def continuous_correlation2_tensor_looped(X, Y, L, numBins, multipliermethod='multiprod'):
-    N, T1 = X.shape
-    M, T2 = Y.shape
-    if T1 != T2:
-        raise ValueError('columns have to match')
-    else:
-        T = T1
+def process_time_bin(args):
+    X, Y, gpMat_t, t = args
+    Xgp = X * gpMat_t
+    Ygp = Y * gpMat_t
+    Xmovingavg = np.sum(X * gpMat_t, axis=1) / np.sum(gpMat_t)
+    Ymovingavg = np.sum(Y * gpMat_t, axis=1) / np.sum(gpMat_t)
     
-    # Gaussian process matrix with weights to nearby time points
+    Xgp = Xgp - np.outer(Xmovingavg, gpMat_t)
+    Ygp = Ygp - np.outer(Ymovingavg, gpMat_t)
+    
+    covMat = np.dot(Xgp, Ygp.T)
+    covMatX = np.dot(Xgp, Xgp.T)
+    covMatY = np.dot(Ygp, Ygp.T)
+    
+    DX = np.sqrt(np.diag(1.0 / np.diag(covMatX)))
+    DY = np.sqrt(np.diag(1.0 / np.diag(covMatY)))
+    
+    corMat = np.dot(np.dot(np.diag(DX), covMat), np.diag(DY))
+    
+    return corMat, covMat, covMatX, covMatY
+
+def continuous_correlation2_tensor_looped(X, Y, L, numBins):
+    N, T = X.shape
+    M, _ = Y.shape
+    
     gpMat = np.exp(-cdist(np.arange(1, T+1).reshape(-1, 1), np.linspace(1, T, numBins).reshape(-1, 1))**2 / (2 * L**2))
     
-    covMat = np.zeros((N, M, numBins))
-    corMat = np.zeros((N, M, numBins))
-    covMatX = np.zeros((N, N, numBins))
-    covMatY = np.zeros((M, M, numBins))
-    
-    for t in range(numBins):
-        Xgp = X * gpMat[:, t]
-        Ygp = Y * gpMat[:, t]
-        Xmovingavg = np.sum(X * gpMat[:, t], axis=1) / np.sum(gpMat[:, t])
-        Ymovingavg = np.sum(Y * gpMat[:, t], axis=1) / np.sum(gpMat[:, t])
-        
-        Xgp = Xgp - np.outer(Xmovingavg, gpMat[:, t])
-        Ygp = Ygp - np.outer(Ymovingavg, gpMat[:, t])
-        
-        covMat[:, :, t] = np.dot(Xgp, Ygp.T)
-        covMatX[:, :, t] = np.dot(Xgp, Xgp.T)
-        covMatY[:, :, t] = np.dot(Ygp, Ygp.T)
-        
-        DX = np.sqrt(np.diag(1.0 / np.diag(covMatX[:, :, t])))
-        DY = np.sqrt(np.diag(1.0 / np.diag(covMatY[:, :, t])))
-        
-        corMat[:, :, t] = np.dot(np.dot(np.diag(DX), covMat[:, :, t]), np.diag(DY))
+    results = [process_time_bin((X, Y, gpMat[:, t], t)) for t in range(numBins)]
+    results_array = np.array(results)
+
+    corMat = results_array[:, 0].transpose(1, 2, 0)
+    covMat = results_array[:, 1].transpose(1, 2, 0)
+    covMatX = results_array[:, 2].transpose(1, 2, 0)
+    covMatY = results_array[:, 3].transpose(1, 2, 0)
     
     return corMat
-
-# Function to perform rolling correlation and plot the results
-def rolling_correlation_two_sided(X, X_pred, chan_labels, offset, sampling_frequency, timeSigma, num_bins, zoom_start=None, zoom_end=None, ax=None):
-    corMat = continuous_correlation2_tensor_looped(X, X_pred, timeSigma, num_bins)
-    cor = np.zeros(X.shape)
-    
-    # Correcting zoom to handle one-dimensional array scaling
-    for i in range(X.shape[0]):
-        cor[i, :] = scipy.ndimage.zoom(corMat[i, i, :], X.shape[1] / corMat.shape[2], order=0)
-
-    if ax is None:
-        fig, ax = plt.subplots(1, 2, figsize=(18, 6))
-    x_axis = np.tile(np.arange(X.shape[1]), (X.shape[0], 1))
-    y_axis_target = X + offset * np.arange(1, X.shape[0] + 1).reshape(-1, 1)
-    y_axis_predicted = X_pred + offset * np.arange(1, X_pred.shape[0] + 1).reshape(-1, 1)
-    
-    for idx, (data, y_axis) in enumerate(zip([X, X_pred], [y_axis_target, y_axis_predicted])):
-        scatter = ax[idx].scatter(x_axis.ravel(), y_axis.ravel(), c=cor.ravel(), cmap='viridis', s=1, vmin=-1, vmax=1)
-        ax[idx].set_title('Target' if idx == 0 else 'Predicted')
-        ax[idx].set_xlabel('time(s)')
-        ax[idx].set_ylabel('Channels')
-        ax[idx].set_yticks(offset * np.arange(data.shape[0]))
-        ax[idx].set_yticklabels(chan_labels)
-        ax[idx].set_xticklabels(np.round(ax[idx].get_xticks() / sampling_frequency, 2))
-        plt.colorbar(scatter, ax=ax[idx], label='Correlation')
-    
-    plt.tight_layout()
-    plt.show()
-
-    return fig
 
 # Function to perform rolling correlation and plot the results
 def rolling_correlation(X, X_pred, chan_labels, offset, sampling_frequency, timeSigma, num_bins, zoom_start=None, zoom_end=None, do_legend=True, do_colorbar=True, ax=None, title=None):
@@ -131,3 +101,36 @@ def rolling_correlation(X, X_pred, chan_labels, offset, sampling_frequency, time
     average_correlation = np.mean(cor)
 
     return ax.get_figure(), average_correlation
+
+def process_channel_rolling_correlation(channel_name, 
+                                        i, 
+                                        targets_train, 
+                                        predictions_train, 
+                                        targets_test, 
+                                        predictions_test, 
+                                        data_config):
+    results = []
+    for targets, predictions, type_label in [
+        (targets_train, predictions_train, 'Train'),
+        (targets_test, predictions_test, 'Test')
+    ]:
+        targets_single = targets[:,:,i].reshape(1, -1)
+        predictions_single = predictions[:,:,i].reshape(1, -1)
+
+        fig, average_correlation = rolling_correlation(
+            targets_single, 
+            predictions_single, 
+            [channel_name], 
+            offset=0,
+            sampling_frequency=data_config['target_sample_rate'],
+            timeSigma=100, 
+            num_bins=50, 
+            zoom_start=0, 
+            do_legend=False,
+            do_colorbar=False,
+            ax=None, 
+            title=''
+        )
+        results.append((type_label, average_correlation, fig))
+    
+    return channel_name, i, results
