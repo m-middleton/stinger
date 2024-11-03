@@ -366,7 +366,7 @@ def read_subjects_data(
 def get_data_nirs_eeg(subject_id_int, data_config, training_config):
 
     # Read and preprocess data
-    eeg_raw_mne, nirs_raw_mne = read_subjects_data(
+    eeg_processed_mne, nirs_processed_mne = read_subjects_data(
         subjects=[f'VP{subject_id_int:03d}'],
         raw_data_directory=RAW_DIRECTORY,
         tasks=data_config['tasks'],
@@ -383,33 +383,35 @@ def get_data_nirs_eeg(subject_id_int, data_config, training_config):
         redo_preprocessing=False,
     )
 
-    fnirs_sample_rate = nirs_raw_mne.info['sfreq']
-    eeg_sample_rate = eeg_raw_mne.info['sfreq']
+    fnirs_sample_rate = nirs_processed_mne.info['sfreq']
+    eeg_sample_rate = eeg_processed_mne.info['sfreq']
 
     #remove HEOG and VEOG
-    eeg_raw_mne.drop_channels(['HEOG', 'VEOG'])
+    eeg_processed_mne.drop_channels(['HEOG', 'VEOG'])
+    # Target filter
+    eeg_processed_mne = eeg_processed_mne.filter(data_config['target_filter_range'][0], data_config['target_filter_range'][1])
 
     if data_config['input_parameters'] == 'hbo':
         # get only hbo
-        nirs_raw_mne.pick(picks='hbo')
+        nirs_processed_mne.pick(picks='hbo')
     elif data_config['input_parameters'] == 'hbr':
         # get only hbr
-        nirs_raw_mne.pick(picks='hbr')
+        nirs_processed_mne.pick(picks='hbr')
     elif data_config['input_parameters'] == 'cbci':
         # Apply CBCI to combine hbo and hbr along anticorrelation
-        nirs_raw_mne = mne_nirs.signal_enhancement.enhance_negative_correlation(nirs_raw_mne)
+        nirs_processed_mne = mne_nirs.signal_enhancement.enhance_negative_correlation(nirs_processed_mne)
     else:
         raise ValueError(f"Invalid input_parameters value: {data_config['input_parameters']}")
 
     input_channel_index = find_indices(list(NIRS_COORDS.keys()), data_config['input_channel_names']) # have to use coords dict because names get changed to source-detector pairs. Have verified order.
-    target_channel_index = find_indices(eeg_raw_mne.ch_names, data_config['target_channel_names'])
+    target_channel_index = find_indices(eeg_processed_mne.ch_names, data_config['target_channel_names'])
 
-    mrk_data, single_events_dict = mne.events_from_annotations(eeg_raw_mne)
+    mrk_data, single_events_dict = mne.events_from_annotations(eeg_processed_mne)
     mrk_data[:,0] -= mrk_data[0,0]
     mrk_data[:,0] += int(eeg_sample_rate)
     
-    eeg_data = eeg_raw_mne.get_data()
-    nirs_data = nirs_raw_mne.get_data()
+    eeg_data = eeg_processed_mne.get_data()
+    nirs_data = nirs_processed_mne.get_data()
     print(f'EEG Shape: {eeg_data.shape}') # n_channels x n_samples_eeg
     print(f'NIRS Shape: {nirs_data.shape}') # n_channels x n_samples_nirs
     print(f'MRK Shape: {mrk_data.shape}') # n_events x 3 (timestamp, event_type, event_id)
@@ -539,6 +541,8 @@ def get_data_eeg_to_eeg(subject_id_int, data_config, training_config, target_cha
 
     # Remove HEOG and VEOG
     eeg_raw_mne.drop_channels(['HEOG', 'VEOG'])
+    # Target filter
+    eeg_processed_mne = eeg_processed_mne.filter(data_config['target_filter_range'][0], data_config['target_filter_range'][1])
 
     mrk_data, single_events_dict = mne.events_from_annotations(eeg_raw_mne)
     mrk_data[:,0] -= mrk_data[0,0]

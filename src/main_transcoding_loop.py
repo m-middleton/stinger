@@ -30,6 +30,7 @@ import wandb
 
 from processing.Format_Data import grab_ordered_windows, grab_random_windows, SignalData  # Updated
 from tokenization.FPCA import MultiChannelFPCA
+from tokenization.Wavelet import MultiChannelWavelet
 from tokenization.Raw_Tokenization import RawTokenizer
 from utilities.Read_Data import get_data_nirs_eeg, get_data_eeg_to_eeg
 from models.Model_Utilities import predict_signal, create_rnn, create_mlp, create_transformer  # Updated
@@ -211,6 +212,12 @@ def run_model(subject_id_int, model_name, model_config, data_config, training_co
             
         elif data_config['tokenization'] == 'fpca':
             tokenizer = MultiChannelFPCA(
+                subject_id=subject_id, 
+                model_weights=MODEL_WEIGHTS,
+                redo_tokenization=data_config['redo_tokenization']
+            )
+        elif data_config['tokenization'] == 'wavelets':
+            tokenizer = MultiChannelWavelet(
                 subject_id=subject_id, 
                 model_weights=MODEL_WEIGHTS,
                 redo_tokenization=data_config['redo_tokenization']
@@ -693,7 +700,7 @@ def main():
 
     # Define channels to use
     input_channel_names = list(NIRS_COORDS.keys())
-    target_channel_names = list(EEG_COORDS.keys())[:5]
+    target_channel_names = list(EEG_COORDS.keys())
 
     
     # input_channel_names = list(EEG_COORDS.keys())
@@ -710,7 +717,8 @@ def main():
         'input_t_max': 10,
         'target_t_min': 0,
         'target_t_max': 1,
-        'tokenization': 'fpca',  # or 'raw'
+        'tokenization': 'fpca',  # or 'raw', 'fpca', 'wavelets'
+        'target_filter_range': [0.5, 4], #, Delta: 0.5–4 Hz, Theta: 4–8 Hz, Alpha: 8-12 Hz, Beta: 12–30 Hz, Gamma: 30–100 Hz
         'redo_tokenization': False,
         'get_data_function': 'get_data_nirs_eeg', #'get_data_eeg_to_eeg', #get_data_nirs_eeg
         'input_parameters': 'cbci', # 'hbo', 'hbr', 'cbci' Only works for get_data_nirs_eeg
@@ -743,7 +751,7 @@ def main():
             'do_train': True,
             'do_load': False,
             'redo_train': True,
-            'num_epochs': 500,
+            'num_epochs': 10,
             'num_train_windows': 1000,
             'test_size': 0.15,
             'validation_size': 0.05,
@@ -762,7 +770,7 @@ def main():
     # from config.training_dictionaries import training_configs, token_sizes, rnn_model_configs, mlp_model_configs
 
     run_number = 1
-    subject_ids = [4]  # Update as needed
+    subject_ids = list(range(1, 28))  # Subject IDs from 1 to 27
     for subject_id in subject_ids:
         for token_size in token_sizes:
             redo_tokenization = True
