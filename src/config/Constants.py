@@ -204,7 +204,7 @@ EEG_COORDS = {'FP1':(-0.3090,0.9511,0.0001), #Fp1
                 # 'AFF6h':(0.5417,0.7777,0.3163),
                 }
 
-# NIRS Ccoordinates
+# NIRS Coordinates
 NIRS_COORDS = {
     'AF7':(-0.5878,0.809,0),
     'AFF5':(-0.6149,0.7564,0.2206),
@@ -276,6 +276,44 @@ EEG_CHANNEL_NAMES = ['FP1',
                     # 'VEOG',
                     ]
 
+NIRS_CHANNEL_NAMES = [
+    'AF7',
+    'AFF5',
+    'AFp7',
+    'AF5h',
+    'AFp3',
+    'AFF3h',
+    'AF1',
+    'AFFz',
+    'AFpz',
+    'AF2',
+    'AFp4',
+    'FCC3',
+    'C3h',
+    'C5h',
+    'CCP3',
+    'CPP3',
+    'P3h',
+    'P5h',
+    'PPO3',
+    'AFF4h',
+    'AF6h',
+    'AFF6',
+    'AFp8',
+    'AF8',
+    'FCC4',
+    'C6h',
+    'C4h',
+    'CCP4',
+    'CPP4',
+    'P6h',
+    'P4h',
+    'PPO4',
+    'PPOz',
+    'PO1',
+    'PO2',
+    'POOz'
+]
 
 # Fake source detector IDS
 SOURCE_IDS = [1,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5,6,6,6,6,7,7,7,7,8,8,8,8,9,9,9,9,10,10,10,10]

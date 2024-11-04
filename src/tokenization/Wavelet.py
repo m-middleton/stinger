@@ -112,19 +112,43 @@ class MultiChannelWavelet(BaseTokenizer):
         window_size = self.input_window_size if signal_type == 'input' else self.target_window_size
         channel_names = self.input_channel_names if signal_type == 'input' else self.target_channel_names
 
-        n_samples, n_channels, _ = data.shape
-
+        n_samples, n_channels, n_tokens = data.shape
         untokenized_data = np.zeros((n_samples, n_channels, int(window_size)))
+
+        # Calculate expected coefficient lengths
+        wavelet_levels = pywt.dwt_max_level(window_size, 'db4')
+        expected_coeffs = pywt.wavedec(np.zeros(window_size), 'db4', level=wavelet_levels)
+        coeff_lengths = [len(c) for c in expected_coeffs]
+        total_coeffs = sum(coeff_lengths)
+
         for idx, channel_name in enumerate(channel_names):
             # Reconstruct coefficients
             coeffs = []
             start = 0
-            for coeff_len in [len(c) for c in pywt.wavedec(np.zeros(window_size), 'db4', level=pywt.dwt_max_level(window_size, 'db4'))]:
-                coeffs.append(data[:, idx, start:start+coeff_len].reshape(-1, coeff_len))
+            
+            for i, coeff_len in enumerate(coeff_lengths):
+                if start >= n_tokens:
+                    # If we've run out of coefficients, pad with zeros
+                    coeffs.append(np.zeros((n_samples, coeff_len)))
+                else:
+                    # Calculate how many coefficients we can actually use
+                    available_coeffs = min(coeff_len, n_tokens - start)
+                    
+                    if available_coeffs < coeff_len:
+                        # Need to pad
+                        pad_data = np.zeros((n_samples, coeff_len))
+                        pad_data[:, :available_coeffs] = data[:, idx, start:start+available_coeffs]
+                        coeffs.append(pad_data)
+                    else:
+                        # Can use full coefficients
+                        coeffs.append(data[:, idx, start:start+coeff_len])
+                
                 start += coeff_len
             
             # Inverse wavelet transform
-            untokenized_data[:, idx, :] = pywt.waverec(coeffs, 'db4')[:, :int(window_size)]
+            reconstructed = pywt.waverec(coeffs, 'db4')
+            # Ensure the output is the correct size
+            untokenized_data[:, idx, :] = reconstructed[:, :int(window_size)]
 
         return untokenized_data
 

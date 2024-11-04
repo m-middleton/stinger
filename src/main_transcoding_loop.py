@@ -717,7 +717,7 @@ def main():
         'input_t_max': 10,
         'target_t_min': 0,
         'target_t_max': 1,
-        'tokenization': 'fpca',  # or 'raw', 'fpca', 'wavelets'
+        'tokenization': 'wavelets',  # or 'raw', 'fpca', 'wavelets'
         'target_filter_range': [0.5, 4], #, Delta: 0.5–4 Hz, Theta: 4–8 Hz, Alpha: 8-12 Hz, Beta: 12–30 Hz, Gamma: 30–100 Hz
         'redo_tokenization': False,
         'get_data_function': 'get_data_nirs_eeg', #'get_data_eeg_to_eeg', #get_data_nirs_eeg
@@ -751,7 +751,7 @@ def main():
             'do_train': True,
             'do_load': False,
             'redo_train': True,
-            'num_epochs': 10,
+            'num_epochs': 100,
             'num_train_windows': 1000,
             'test_size': 0.15,
             'validation_size': 0.05,
@@ -770,7 +770,8 @@ def main():
     # from config.training_dictionaries import training_configs, token_sizes, rnn_model_configs, mlp_model_configs
 
     run_number = 1
-    subject_ids = list(range(1, 28))  # Subject IDs from 1 to 27
+    #subject_ids = list(range(1, 28))  # Subject IDs from 1 to 27
+    subject_ids = [4]
     for subject_id in subject_ids:
         for token_size in token_sizes:
             redo_tokenization = True
